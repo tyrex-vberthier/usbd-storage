@@ -335,7 +335,15 @@ where
             }
         }
 
-        map_ignore(self.transport.read())?;
+        // During the OUT (host→device) data phase the bulk callback owns the
+        // shared OUT endpoint via a single large dTD.  The per-packet
+        // `transport.read()` path collides with that prime (it re-primes a
+        // 512-byte per-packet OUT transfer on the same endpoint, blocking the
+        // bulk prime and stealing the host's data), so skip it in that phase.
+        // The IN data phase and the CBW/CSW phases use the normal path.
+        if !self.transport.is_bulk_out_phase() {
+            map_ignore(self.transport.read())?;
+        }
         map_ignore(self.transport.write())?;
 
         if let Some(raw_cb) = self.transport.get_command() {
@@ -366,7 +374,15 @@ where
                             return Err(err);
                         }
                     };
-                    map_ignore(self.transport.read())?;
+                    // In the OUT data phase, advance to the CSW once the callback
+                    // has set a status — but WITHOUT a per-packet read (which
+                    // would collide with the bulk OUT prime).  Otherwise drive
+                    // the normal per-packet read.
+                    if self.transport.is_bulk_out_phase() {
+                        map_ignore(self.transport.finish_bulk_out_phase())?;
+                    } else {
+                        map_ignore(self.transport.read())?;
+                    }
 
                     break;
                 }
