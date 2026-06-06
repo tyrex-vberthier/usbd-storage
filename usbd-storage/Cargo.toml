@@ -29,6 +29,11 @@ bbb = []
 ufi = []
 scsi = []
 extended_addressing = []
+imxrt-bulk = ["bbb", "dep:imxrt-usbd"]
+
+[dependencies.imxrt-usbd]
+git = "https://github.com/tyrex-vberthier/imxrt-usbd"
+optional = true
 
 [[test]]
 name = "scsi_bbb"

@@ -299,6 +299,84 @@ impl<'alloc, Bus: UsbBus + 'alloc, Buf: BorrowMut<[u8]>> Scsi<BulkOnly<'alloc, B
     }
 }
 
+/// `poll_bulk` — like [`Scsi::poll`] but the callback receives a [`Command`]
+/// that also has access to the big-transfer [`Command::bulk_write_data`] /
+/// [`Command::bulk_read_data`] helpers.
+///
+/// Available whenever the bus satisfies both [`UsbBus`] and
+/// [`crate::bulk::BulkBus`].  The SPC small-data path in the callback can
+/// still use the ordinary [`Command::write_data`] / [`Command::read_data`]
+/// / [`Command::try_write_data_all`] helpers — `poll_bulk` only widens the
+/// callback's capability; it does not restrict it.
+///
+/// `Scsi::poll` is left fully intact; use it when the bus does not implement
+/// `BulkBus`.
+#[cfg(feature = "bbb")]
+impl<'alloc, Bus, Buf> Scsi<BulkOnly<'alloc, Bus, Buf>>
+where
+    Bus: UsbBus + crate::bulk::BulkBus + 'alloc,
+    Buf: BorrowMut<[u8]>,
+{
+    /// Drive subclass in both directions using the bulk fast-path.
+    ///
+    /// Identical dispatch logic to [`Scsi::poll`]; the difference is that the
+    /// bus reference is threaded through to the callback so the READ/WRITE arms
+    /// can call [`Command::bulk_write_data`] / [`Command::bulk_read_data`].
+    pub fn poll_bulk<F>(&mut self, bus: &Bus, mut callback: F) -> Result<(), UsbError>
+    where
+        F: FnMut(Command<ScsiCommand, Scsi<BulkOnly<'alloc, Bus, Buf>>>, &Bus),
+    {
+        fn map_ignore<T>(res: Result<T, TransportError<BulkOnlyError>>) -> Result<(), UsbError> {
+            match res {
+                Ok(_)
+                | Err(TransportError::Usb(UsbError::WouldBlock))
+                | Err(TransportError::Error(_)) => Ok(()),
+                Err(TransportError::Usb(err)) => Err(err),
+            }
+        }
+
+        map_ignore(self.transport.read())?;
+        map_ignore(self.transport.write())?;
+
+        if let Some(raw_cb) = self.transport.get_command() {
+            if !self.transport.has_status() {
+                let lun = raw_cb.lun;
+                let kind = parse_cb(raw_cb.bytes);
+
+                debug!("usb: scsi: Command (bulk): {}", kind);
+
+                loop {
+                    callback(
+                        Command {
+                            class: self,
+                            kind,
+                            lun,
+                        },
+                        bus,
+                    );
+
+                    match self.transport.write() {
+                        Err(TransportError::Error(BulkOnlyError::FullPacketExpected)) => {
+                            continue;
+                        }
+                        Ok(_)
+                        | Err(TransportError::Error(_))
+                        | Err(TransportError::Usb(UsbError::WouldBlock)) => { /* ignore */ }
+                        Err(TransportError::Usb(err)) => {
+                            return Err(err);
+                        }
+                    };
+                    map_ignore(self.transport.read())?;
+
+                    break;
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
 impl<Bus, T> UsbClass<Bus> for Scsi<T>
 where
     Bus: UsbBus,

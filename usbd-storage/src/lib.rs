@@ -29,9 +29,12 @@
 
 #[cfg(feature = "bbb")]
 pub(crate) mod buffer;
+pub mod bulk;
 pub(crate) mod fmt;
 pub mod subclass;
 pub mod transport;
+
+pub use bulk::BulkBus;
 
 /// USB Mass Storage Class code
 pub const CLASS_MASS_STORAGE: u8 = 0x08;

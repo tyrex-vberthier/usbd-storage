@@ -93,6 +93,13 @@ pub struct BulkOnly<'alloc, Bus: UsbBus, Buf: BorrowMut<[u8]>> {
     cbw: CommandBlockWrapper,
     cs: Option<CommandStatus>,
     max_lun: u8,
+    /// Whether a bulk big-transfer dTD is currently in flight on the bus.
+    ///
+    /// Set to `true` after priming via [`bulk_write_data`] or [`bulk_read_data`]
+    /// and cleared when [`BulkBus::bulk_poll`] returns `Some(n)`.  Necessary
+    /// because after a completed transfer the EP is unprimed, so a bus-state-only
+    /// check cannot distinguish "never primed" from "just completed".
+    bulk_in_flight: bool,
 }
 
 impl<'alloc, Bus, Buf> BulkOnly<'alloc, Bus, Buf>
@@ -142,6 +149,7 @@ where
             cbw: Default::default(),
             cs: Default::default(),
             max_lun,
+            bulk_in_flight: false,
         })
     }
 
@@ -207,15 +215,16 @@ where
         if !matches!(self.state, State::DataTransferFromHost) {
             return Err(TransportError::Error(BulkOnlyError::InvalidState));
         }
+        // The closure always returns Ok, so the outer Result is always Ok too.
         Ok(self
             .buf
             .read(|buf| {
                 // fill 'dst' or however much is in 'buf'
                 let size = min(dst.len(), buf.len());
                 dst[..size].copy_from_slice(&buf[..size]);
-                Ok::<usize, ()>(size)
+                Ok::<usize, core::convert::Infallible>(size)
             })
-            .unwrap())
+            .unwrap_or(0))
     }
 
     /// Writes data from the IO buffer returning the number of bytes actually written
@@ -384,8 +393,10 @@ where
             }
         }
 
-        // write CSW into buffer
-        let csw = self.build_csw().unwrap();
+        // write CSW into buffer — cs must be Some here (enforced by check_end_data_transfer)
+        let csw = self
+            .build_csw()
+            .ok_or(TransportError::Error(BulkOnlyError::InvalidState))?;
         self.buf.clean();
         self.buf.write(csw.as_slice());
 
@@ -416,12 +427,13 @@ where
 
         // read CBW from buf
         let mut raw_cbw = [0u8; CBW_LEN];
+        // The closure always returns Ok; unwrap_or(0) is unreachable but avoids unwrap().
         self.buf
-            .read::<()>(|buf| {
+            .read::<core::convert::Infallible>(|buf| {
                 raw_cbw.copy_from_slice(&buf[..CBW_LEN]); // buf.len() checked in the beginning
                 Ok(CBW_LEN)
             })
-            .unwrap();
+            .unwrap_or(0);
 
         // check if CBW is valid. Spec. 6.2.1
         if !raw_cbw.starts_with(&CBW_SIGNATURE_LE) {
@@ -528,13 +540,136 @@ where
     #[inline]
     fn enter_state(&mut self, state: State) {
         info!("usb: bbb: Enter state: {}", state);
-        // clean if going Idle
+        // clean if going Idle — also clear the bulk in-flight flag so a stale
+        // flag from a previous command cannot leak into the next one.
         if matches!(state, State::Idle) {
             self.buf.clean();
             self.cbw = Default::default();
             self.cs = None;
+            self.bulk_in_flight = false;
         }
         self.state = state;
+    }
+}
+
+/// Big-transfer data-phase methods — available on any bus that implements [`crate::bulk::BulkBus`].
+///
+/// These bypass the per-packet IO buffer and hand an entire slice to the bus
+/// controller as a single bulk transfer descriptor (dTD).  Use them only for
+/// the READ/WRITE *data* phase; CBW, CSW, and SPC small-data paths continue to
+/// use the existing [`write_data`] / [`try_write_data_all`] helpers.
+///
+/// [`write_data`]: BulkOnly::write_data
+/// [`try_write_data_all`]: BulkOnly::try_write_data_all
+#[cfg(feature = "bbb")]
+impl<'alloc, Bus, Buf> BulkOnly<'alloc, Bus, Buf>
+where
+    Bus: UsbBus + crate::bulk::BulkBus,
+    Buf: BorrowMut<[u8]>,
+{
+    /// Bulk IN data phase: prime `src` as ONE multi-packet transfer descriptor.
+    ///
+    /// Non-blocking: the first call primes the transfer and returns
+    /// [`TransportError::Usb(UsbError::WouldBlock)`].  Subsequent calls poll for
+    /// completion; once the controller confirms the dTD is done they return
+    /// `Ok(n)` and decrement the residue.
+    ///
+    /// The caller **must** pass the same `src` slice on every call for a given
+    /// data phase — the slice must remain valid until `Ok` is returned.
+    ///
+    /// # Errors
+    /// * [`TransportError::Usb(UsbError::WouldBlock)`] — transfer primed or still
+    ///   in flight; call again on the next poll cycle.
+    /// * [`TransportError::Error(BulkOnlyError::InvalidState)`] — not currently
+    ///   in the IN data-transfer state.
+    pub fn bulk_write_data(
+        &mut self,
+        bus: &Bus,
+        src: &[u8],
+    ) -> BulkOnlyTransportResult<usize> {
+        if !matches!(self.state, State::DataTransferToHost) {
+            return Err(TransportError::Error(BulkOnlyError::InvalidState));
+        }
+        // Clamp to whatever residue remains.
+        let len = min(src.len(), self.cbw.data_transfer_len as usize);
+        let src = &src[..len];
+
+        let ep = self.in_ep.address();
+
+        if !self.bulk_in_flight {
+            // First call: prime the transfer and return WouldBlock.
+            crate::bulk::BulkBus::bulk_write(bus, ep, src).map_err(TransportError::Usb)?;
+            self.bulk_in_flight = true;
+            return Err(TransportError::Usb(UsbError::WouldBlock));
+        }
+
+        // Subsequent calls: check whether the controller has completed the dTD.
+        match crate::bulk::BulkBus::bulk_poll(bus, ep) {
+            Some(n) => {
+                self.bulk_in_flight = false;
+                self.cbw.data_transfer_len =
+                    self.cbw.data_transfer_len.saturating_sub(n as u32);
+                trace!(
+                    "usb: bbb: bulk_write_data: {} bytes, residue: {}",
+                    n,
+                    self.cbw.data_transfer_len
+                );
+                Ok(n)
+            }
+            None => Err(TransportError::Usb(UsbError::WouldBlock)),
+        }
+    }
+
+    /// Bulk OUT data phase: prime `dst` for one multi-packet transfer descriptor.
+    ///
+    /// Non-blocking: the first call primes the OUT endpoint and returns
+    /// [`TransportError::Usb(UsbError::WouldBlock)`].  Subsequent calls poll for
+    /// completion; once the host has delivered the data they return `Ok(n)` and
+    /// decrement the residue.
+    ///
+    /// The caller **must** pass the same `dst` slice on every call for a given
+    /// data phase — the slice must remain valid and unmodified until `Ok` is
+    /// returned.
+    ///
+    /// # Errors
+    /// * [`TransportError::Usb(UsbError::WouldBlock)`] — transfer primed or still
+    ///   in flight; call again on the next poll cycle.
+    /// * [`TransportError::Error(BulkOnlyError::InvalidState)`] — not currently
+    ///   in the OUT data-transfer state.
+    pub fn bulk_read_data(
+        &mut self,
+        bus: &Bus,
+        dst: &mut [u8],
+    ) -> BulkOnlyTransportResult<usize> {
+        if !matches!(self.state, State::DataTransferFromHost) {
+            return Err(TransportError::Error(BulkOnlyError::InvalidState));
+        }
+
+        let ep = self.out_ep.address();
+
+        if !self.bulk_in_flight {
+            // First call: prime the OUT endpoint and return WouldBlock.
+            crate::bulk::BulkBus::bulk_read_prime(bus, ep, dst)
+                .map_err(TransportError::Usb)?;
+            self.bulk_in_flight = true;
+            return Err(TransportError::Usb(UsbError::WouldBlock));
+        }
+
+        // Subsequent calls: check whether the host has delivered the data.
+        match crate::bulk::BulkBus::bulk_poll(bus, ep) {
+            Some(n) => {
+                self.bulk_in_flight = false;
+                self.cbw.data_transfer_len =
+                    self.cbw.data_transfer_len.saturating_sub(n as u32);
+                trace!(
+                    "usb: bbb: bulk_read_data: {} bytes, residue: {}",
+                    n,
+                    self.cbw.data_transfer_len
+                );
+                Ok(n)
+            }
+            None => Err(TransportError::Usb(UsbError::WouldBlock)),
+        }
     }
 }
 
@@ -605,29 +740,44 @@ impl CommandBlockWrapper {
             return Err(InvalidCbwError);
         }
 
-        Ok(CommandBlockWrapper {
-            tag: u32::from_le_bytes(value[..4].try_into().unwrap()),
-            data_transfer_len: u32::from_le_bytes(value[4..8].try_into().unwrap()),
-            direction: if u32::from_le_bytes(value[4..8].try_into().unwrap()) != 0 {
-                if (value[8] & (1 << 7)) > 0 {
-                    DataDirection::In
-                } else {
-                    DataDirection::Out
-                }
+        // These slices are always exactly 4 / 4 / 16 bytes given the CBW layout;
+        // map the (unreachable) TryInto failure to InvalidCbwError rather than
+        // unwrapping.
+        let tag = u32::from_le_bytes(
+            value[..4].try_into().map_err(|_| InvalidCbwError)?,
+        );
+        let data_transfer_len = u32::from_le_bytes(
+            value[4..8].try_into().map_err(|_| InvalidCbwError)?,
+        );
+        let direction = if data_transfer_len != 0 {
+            if (value[8] & (1 << 7)) > 0 {
+                DataDirection::In
             } else {
-                DataDirection::NotExpected
-            },
+                DataDirection::Out
+            }
+        } else {
+            DataDirection::NotExpected
+        };
+        let block: [u8; 16] = value[11..].try_into().map_err(|_| InvalidCbwError)?;
+
+        Ok(CommandBlockWrapper {
+            tag,
+            data_transfer_len,
+            direction,
             lun: value[9] & 0b00001111,
             block_len: block_len as usize,
-            block: value[11..].try_into().unwrap(), // ok, because we checked a length
+            block,
         })
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::bulk::BulkBus;
     use crate::transport::bbb::BulkOnly;
-    use crate::transport::bbb::State::DataTransferFromHost;
+    use crate::transport::bbb::State::{DataTransferFromHost, DataTransferToHost};
+    use crate::transport::CommandStatus;
+    use crate::transport::TransportError;
     use usb_device::bus::{PollResult, UsbBus, UsbBusAllocator};
     use usb_device::class_prelude::{EndpointAddress, EndpointType};
     use usb_device::{UsbDirection, UsbError};
@@ -670,6 +820,31 @@ mod tests {
         }
     }
 
+    /// Extend `DummyBus` with a `BulkBus` impl for testing the big-transfer
+    /// path without a real `imxrt-usbd` controller.
+    ///
+    /// `bulk_write` reports the slice length as accepted.
+    /// `bulk_read_prime` always succeeds.
+    /// `bulk_poll` returns `Some(512)` — simulates immediate hardware completion.
+    impl BulkBus for DummyBus {
+        fn bulk_write(&self, _ep: EndpointAddress, buf: &[u8]) -> Result<usize, UsbError> {
+            Ok(buf.len())
+        }
+
+        fn bulk_read_prime(
+            &self,
+            _ep: EndpointAddress,
+            _buf: &mut [u8],
+        ) -> Result<(), UsbError> {
+            Ok(())
+        }
+
+        fn bulk_poll(&self, _ep: EndpointAddress) -> Option<usize> {
+            // Simulates immediate hardware completion.
+            Some(512)
+        }
+    }
+
     #[test]
     fn should_read_data_into_small_buffer() {
         const BUF_SIZE: usize = 512;
@@ -681,5 +856,55 @@ mod tests {
         bbb.buf.write([0xFFu8; BUF_SIZE].as_slice()); // fill the buffer
 
         assert_eq!(N, bbb.read_data([0u8; N].as_mut_slice()).unwrap());
+    }
+
+    /// Verify that `bulk_write_data` has non-blocking semantics:
+    ///
+    /// - Call 1: primes the transfer, returns `WouldBlock`.
+    /// - Call 2: polls completion, returns `Ok(512)` and decrements the residue.
+    ///
+    /// Also confirms that the eventual CSW carries residue == 0.
+    #[test]
+    fn bulk_write_data_reports_count_and_decrements_residue() {
+        const DATA_LEN: usize = 512;
+
+        let alloc = UsbBusAllocator::new(DummyBus);
+        let mut bbb = BulkOnly::new(&alloc, 64, 0, vec![0u8; 1024]).unwrap();
+
+        // Manually place the transport in the IN data-transfer state with a
+        // 512-byte residue (mimics what start_data_transfer does after a CBW).
+        bbb.state = DataTransferToHost;
+        bbb.cbw.data_transfer_len = DATA_LEN as u32;
+
+        let src = vec![0xAAu8; DATA_LEN];
+        let bus = DummyBus;
+
+        // First call: primes the transfer — must return WouldBlock.
+        let first = bbb.bulk_write_data(&bus, &src);
+        assert!(
+            matches!(first, Err(TransportError::Usb(UsbError::WouldBlock))),
+            "first call must return WouldBlock (transfer primed, not yet complete)"
+        );
+        assert_eq!(
+            DATA_LEN as u32,
+            bbb.cbw.data_transfer_len,
+            "residue must not change after priming"
+        );
+
+        // Second call: polls completion — DummyBus::bulk_poll returns Some(512).
+        let count = bbb.bulk_write_data(&bus, &src).unwrap();
+
+        assert_eq!(DATA_LEN, count, "bulk_write_data must return the byte count");
+        assert_eq!(
+            0,
+            bbb.cbw.data_transfer_len,
+            "residue must reach zero after a full transfer"
+        );
+
+        // Confirm the eventual CSW would carry residue == 0 (Passed status).
+        bbb.set_status(CommandStatus::Passed);
+        let csw_bytes = bbb.build_csw().expect("CSW must be built after set_status");
+        let csw_residue = u32::from_le_bytes(csw_bytes[8..12].try_into().unwrap());
+        assert_eq!(0, csw_residue, "CSW residue must be 0 after full transfer");
     }
 }

@@ -96,3 +96,39 @@ impl<'a, 'alloc, Bus: UsbBus + 'alloc, Buf: BorrowMut<[u8]>>
         self.class.transport.set_status(CommandStatus::PhaseError);
     }
 }
+
+/// [SCSI] over [Bulk Only Transport] command — big-transfer (bulk-dTD) helpers.
+///
+/// These forward to [`BulkOnly::bulk_write_data`] / [`BulkOnly::bulk_read_data`]
+/// and are only available when the bus also implements [`crate::bulk::BulkBus`].
+///
+/// [SCSI]: crate::subclass::scsi::Scsi
+/// [Bulk Only Transport]: crate::transport::bbb::BulkOnly
+#[cfg(all(feature = "bbb", feature = "scsi"))]
+impl<'a, 'alloc, Bus, Buf> Command<'a, ScsiCommand, Scsi<BulkOnly<'alloc, Bus, Buf>>>
+where
+    Bus: UsbBus + crate::bulk::BulkBus + 'alloc,
+    Buf: BorrowMut<[u8]>,
+{
+    /// Prime `src` as ONE large Bulk IN transfer descriptor.
+    ///
+    /// Forwards to [`BulkOnly::bulk_write_data`].
+    pub fn bulk_write_data(
+        &mut self,
+        bus: &Bus,
+        src: &[u8],
+    ) -> Result<usize, TransportError<BulkOnlyError>> {
+        self.class.transport.bulk_write_data(bus, src)
+    }
+
+    /// Prime `dst` for ONE large Bulk OUT transfer descriptor.
+    ///
+    /// Forwards to [`BulkOnly::bulk_read_data`].
+    pub fn bulk_read_data(
+        &mut self,
+        bus: &Bus,
+        dst: &mut [u8],
+    ) -> Result<usize, TransportError<BulkOnlyError>> {
+        self.class.transport.bulk_read_data(bus, dst)
+    }
+}
