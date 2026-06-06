@@ -30,6 +30,7 @@ ufi = []
 scsi = []
 extended_addressing = []
 imxrt-bulk = ["bbb", "dep:imxrt-usbd"]
+ring = ["bbb"]                            # Lever B: looping ring-filling pump
 
 [dependencies.imxrt-usbd]
 git = "https://github.com/tyrex-vberthier/imxrt-usbd"

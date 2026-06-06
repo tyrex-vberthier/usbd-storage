@@ -333,6 +333,7 @@ where
         Ok(())
     }
 
+    #[cfg(not(feature = "ring"))]
     fn handle_read_from_host(&mut self) -> BulkOnlyTransportResult<()> {
         if !self.status_present() {
             let count = self.read_packet()?; // propagate if error or WouldBlock
@@ -342,6 +343,27 @@ where
         self.check_end_data_transfer()
     }
 
+    #[cfg(feature = "ring")]
+    fn handle_read_from_host(&mut self) -> BulkOnlyTransportResult<()> {
+        if !self.status_present() {
+            // Ring pump: drain every packet the ring delivers this poll, not just one.
+            loop {
+                match self.read_packet() {
+                    Ok(count) => {
+                        self.cbw.data_transfer_len =
+                            self.cbw.data_transfer_len.saturating_sub(count as u32);
+                        trace!("usb: bbb: Data residue: {}", self.cbw.data_transfer_len);
+                    }
+                    // ring drained (no more completed OUT slots) — resume next poll
+                    Err(TransportError::Usb(UsbError::WouldBlock)) => break,
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        self.check_end_data_transfer()
+    }
+
+    #[cfg(not(feature = "ring"))]
     fn handle_write_to_host(&mut self) -> BulkOnlyTransportResult<()> {
         // Do not send a short packet if there is not enough data in the buffer. Some drivers
         // consider this as an error.
@@ -366,6 +388,34 @@ where
                 self.cbw.data_transfer_len =
                     self.cbw.data_transfer_len.saturating_sub(count as u32);
                 trace!("usb: bbb: Data residue: {}", self.cbw.data_transfer_len);
+            }
+            self.check_end_data_transfer()
+        } else {
+            Err(TransportError::Error(BulkOnlyError::FullPacketExpected))
+        }
+    }
+
+    #[cfg(feature = "ring")]
+    fn handle_write_to_host(&mut self) -> BulkOnlyTransportResult<()> {
+        let max_packet_size = self.packet_size() as u32;
+        let full_packet_expected =
+            self.cbw.data_transfer_len >= max_packet_size && !self.status_present();
+        let full_packet = self.buf.available_read() >= max_packet_size as usize;
+        let full_packet_or_zero = full_packet || !full_packet_expected;
+        if full_packet_or_zero {
+            // Ring pump: push packets until the ring is full (WouldBlock) or the
+            // IO buffer drains. Stock sends exactly one packet per poll.
+            while self.buf.available_read() > 0 {
+                match self.write_packet() {
+                    Ok(count) => {
+                        self.cbw.data_transfer_len =
+                            self.cbw.data_transfer_len.saturating_sub(count as u32);
+                        trace!("usb: bbb: Data residue: {}", self.cbw.data_transfer_len);
+                    }
+                    // ring full — resume next poll
+                    Err(TransportError::Usb(UsbError::WouldBlock)) => break,
+                    Err(e) => return Err(e),
+                }
             }
             self.check_end_data_transfer()
         } else {
@@ -852,6 +902,89 @@ mod tests {
             // Simulates immediate hardware completion.
             Some(512)
         }
+    }
+
+    /// A bus that simulates a depth-N ring: the per-packet `write` accepts up to
+    /// `depth` packets (returning `Ok(len)`) then returns `WouldBlock`, mimicking
+    /// the imxrt-usbd ring filling up. Used to test the Lever B looping pump.
+    #[cfg(feature = "ring")]
+    struct RingBus {
+        depth: usize,
+        primed: core::sync::atomic::AtomicUsize,
+    }
+
+    #[cfg(feature = "ring")]
+    impl UsbBus for RingBus {
+        fn alloc_ep(
+            &mut self,
+            _d: UsbDirection,
+            _a: Option<EndpointAddress>,
+            _t: EndpointType,
+            _m: u16,
+            _i: u8,
+        ) -> usb_device::Result<EndpointAddress> {
+            Ok(EndpointAddress::from(0))
+        }
+        fn enable(&mut self) {}
+        fn reset(&self) {}
+        fn set_device_address(&self, _a: u8) {}
+        fn write(&self, _ep: EndpointAddress, buf: &[u8]) -> usb_device::Result<usize> {
+            let current = self.primed.load(core::sync::atomic::Ordering::Relaxed);
+            if current >= self.depth {
+                return Err(UsbError::WouldBlock);
+            }
+            self.primed
+                .store(current + 1, core::sync::atomic::Ordering::Relaxed);
+            Ok(buf.len())
+        }
+        fn read(&self, _ep: EndpointAddress, _buf: &mut [u8]) -> usb_device::Result<usize> {
+            Err(UsbError::WouldBlock)
+        }
+        fn set_stalled(&self, _e: EndpointAddress, _s: bool) {}
+        fn is_stalled(&self, _e: EndpointAddress) -> bool {
+            false
+        }
+        fn suspend(&self) {}
+        fn resume(&self) {}
+        fn poll(&self) -> PollResult {
+            PollResult::None
+        }
+    }
+
+    /// The Lever B ring pump must drain up to `depth` packets per poll (until the
+    /// simulated ring reports `WouldBlock`), decrementing residue by exactly the
+    /// bytes sent, rather than sending a single packet like the stock path.
+    #[cfg(feature = "ring")]
+    #[test]
+    fn ring_pump_drains_until_wouldblock() {
+        use usb_device::device::{UsbDeviceBuilder, UsbVidPid};
+
+        const DEPTH: usize = 8;
+        const MPS: usize = 512;
+        const BUF: usize = DEPTH * MPS; // IO buffer holds a full ring's worth
+
+        let alloc = UsbBusAllocator::new(RingBus {
+            depth: DEPTH,
+            primed: core::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut bbb = BulkOnly::new(&alloc, MPS as u16, 0, vec![0u8; BUF]).unwrap();
+        // Trigger UsbBusAllocator::freeze() so endpoint bus_ptr is non-null.
+        let _usb_dev = UsbDeviceBuilder::new(&alloc, UsbVidPid(0x0000, 0x0000)).build();
+
+        bbb.state = DataTransferToHost;
+        bbb.cbw.data_transfer_len = (BUF as u32) * 2; // plenty of residue, > one ring
+        bbb.buf.write(vec![0xABu8; BUF].as_slice()); // stage a full ring of data
+
+        // One write() drives handle_write_to_host once. The ring pump must send
+        // DEPTH packets this single poll (stock would send exactly 1).
+        bbb.write().unwrap();
+
+        let sent = (BUF as u32 * 2) - bbb.cbw.data_transfer_len;
+        assert_eq!(
+            (DEPTH * MPS) as u32,
+            sent,
+            "ring pump must send DEPTH packets per poll, not one"
+        );
     }
 
     #[test]
