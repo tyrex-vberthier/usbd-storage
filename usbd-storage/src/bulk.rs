@@ -38,6 +38,16 @@ pub trait BulkBus {
     /// Returns `Some(n)` with the byte count once complete, or `None` while
     /// still in progress.
     fn bulk_poll(&self, ep: EndpointAddress) -> Option<usize>;
+
+    /// Returns `true` when the IN endpoint `ep` has no in-flight transfers
+    /// (its multi-TD ring is fully drained to the host).
+    ///
+    /// The Bulk-Only transport uses this to serialize the CSW: the IN ring must
+    /// be empty at a command boundary, or a multi-TD bus pipelines the next
+    /// command's response ahead of the prior CSW and the host reads a stale or
+    /// duplicate status. Buses with no ring (one transfer in flight) can return
+    /// `true` once the prior transfer is delivered.
+    fn in_ep_drained(&self, ep: EndpointAddress) -> bool;
 }
 
 /// `imxrt-usbd`-specific implementation.
@@ -59,5 +69,9 @@ impl BulkBus for imxrt_usbd::BusAdapter {
 
     fn bulk_poll(&self, ep: EndpointAddress) -> Option<usize> {
         self.bulk_poll_complete(ep)
+    }
+
+    fn in_ep_drained(&self, ep: EndpointAddress) -> bool {
+        imxrt_usbd::BusAdapter::in_ep_drained(self, ep)
     }
 }

@@ -172,6 +172,32 @@ where
         }
     }
 
+    /// Ring-aware variant of [`write`](Self::write).
+    ///
+    /// Identical to `write` except the CSW status phase is serialized against the
+    /// IN ring: `in_drained` must report whether the IN endpoint's multi-TD ring
+    /// has fully drained, so the transport only advances to `Idle` once the host
+    /// has actually read the CSW. Drive this (instead of `write`) from
+    /// [`Scsi::poll_ring`](crate::subclass::scsi::Scsi::poll_ring).
+    #[cfg(feature = "ring")]
+    pub fn write_ring(&mut self, in_drained: bool) -> BulkOnlyTransportResult<()> {
+        match self.state {
+            State::StatusTransfer => self.handle_write_csw_ring(in_drained),
+            State::DataTransferToHost => self.handle_write_to_host(),
+            State::DataTransferNoData => self.handle_no_data_transfer(),
+            _ => Ok(()),
+        }
+    }
+
+    /// The IN (device→host) bulk endpoint address.
+    ///
+    /// Exposed so a ring-aware driver loop can query the bus for IN-ring drain
+    /// state (see [`write_ring`](Self::write_ring)).
+    #[cfg(feature = "ring")]
+    pub fn in_ep_address(&self) -> usb_device::endpoint::EndpointAddress {
+        self.in_ep.address()
+    }
+
     /// Sets a `status` of the current command
     ///
     /// This method doesn't try to send a status immediately. However, all further
@@ -435,6 +461,36 @@ where
         Ok(())
     }
 
+    /// CSW status phase for a multi-TD ring bus.
+    ///
+    /// Unlike [`handle_write_csw`], the transition to `Idle` is gated on the IN
+    /// ring being fully **drained** (`in_drained`), not merely on the CSW having
+    /// been written into the IO buffer. A multi-TD ring accepts a `write` while
+    /// earlier dTDs are still in flight, so the stock "Idle once the buffer is
+    /// empty" rule would let the *next* command's response be primed ahead of this
+    /// CSW — the host then reads a stale or duplicate CSW (a BOT phase error that
+    /// triggers a device reset). Keeping the ring empty at every command boundary
+    /// preserves BOT serialization while still allowing pipelining *within* a
+    /// command's data phase.
+    #[cfg(feature = "ring")]
+    fn handle_write_csw_ring(&mut self, in_drained: bool) -> BulkOnlyTransportResult<()> {
+        if self.buf.available_read() > 0 {
+            // CSW not yet primed into the ring. Prime it; a ring-full WouldBlock
+            // just means retry next poll (data dTDs still occupying the ring).
+            match self.write_packet() {
+                Ok(_) | Err(TransportError::Usb(UsbError::WouldBlock)) => Ok(()),
+                Err(e) => Err(e),
+            }
+        } else if in_drained {
+            // CSW primed AND delivered (ring drained) — the command is truly done.
+            self.enter_state(State::Idle);
+            Ok(())
+        } else {
+            // CSW primed but still in flight — wait for the host to read it.
+            Ok(())
+        }
+    }
+
     fn check_end_data_transfer(&mut self) -> BulkOnlyTransportResult<()> {
         match self.state {
             State::DataTransferNoData | State::DataTransferFromHost => {
@@ -478,7 +534,19 @@ where
         self.buf.write(csw.as_slice());
 
         self.enter_state(State::StatusTransfer);
-        self.write() // flush
+        // Flush (prime) the CSW. On the ring path we must NOT advance to Idle here:
+        // the CSW has only been primed into the multi-TD ring, not yet delivered to
+        // the host. `poll_ring` drives the StatusTransfer→Idle transition once the
+        // IN ring has drained, so the next command's response cannot pipeline ahead
+        // of this CSW (which the host would read as a stale/duplicate status).
+        #[cfg(feature = "ring")]
+        {
+            self.handle_write_csw_ring(false)
+        }
+        #[cfg(not(feature = "ring"))]
+        {
+            self.write() // flush
+        }
     }
 
     #[inline]
@@ -901,6 +969,12 @@ mod tests {
         fn bulk_poll(&self, _ep: EndpointAddress) -> Option<usize> {
             // Simulates immediate hardware completion.
             Some(512)
+        }
+
+        fn in_ep_drained(&self, _ep: EndpointAddress) -> bool {
+            // No ring: the simulated transfer completes immediately, so the IN
+            // endpoint is always considered drained.
+            true
         }
     }
 

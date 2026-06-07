@@ -391,6 +391,77 @@ where
 
         Ok(())
     }
+
+    /// Ring-aware variant of [`Scsi::poll`] for a multi-TD bus.
+    ///
+    /// Identical dispatch to [`Scsi::poll`], except the CSW status phase is
+    /// serialized against the IN ring: before each transport write, the bus is
+    /// queried via [`BulkBus::in_ep_drained`] and the result threaded into
+    /// [`BulkOnly::write_ring`]. This keeps the IN ring empty at every command
+    /// boundary, so the next command's response cannot pipeline ahead of the
+    /// current CSW (which the host would read as a stale/duplicate status — a BOT
+    /// phase error that resets the device). Within a command's data phase the ring
+    /// still pipelines freely. The callback uses the ordinary per-packet
+    /// `write_data`/`read_data` helpers.
+    ///
+    /// [`BulkBus::in_ep_drained`]: crate::bulk::BulkBus::in_ep_drained
+    /// [`BulkOnly::write_ring`]: crate::transport::bbb::BulkOnly::write_ring
+    #[cfg(feature = "ring")]
+    pub fn poll_ring<F>(&mut self, bus: &Bus, mut callback: F) -> Result<(), UsbError>
+    where
+        F: FnMut(Command<ScsiCommand, Scsi<BulkOnly<'alloc, Bus, Buf>>>),
+    {
+        fn map_ignore<T>(res: Result<T, TransportError<BulkOnlyError>>) -> Result<(), UsbError> {
+            match res {
+                Ok(_)
+                | Err(TransportError::Usb(UsbError::WouldBlock))
+                | Err(TransportError::Error(_)) => Ok(()),
+                Err(TransportError::Usb(err)) => Err(err),
+            }
+        }
+
+        let in_addr = self.transport.in_ep_address();
+
+        // drive transport in both directions before user action
+        map_ignore(self.transport.read())?;
+        map_ignore(self.transport.write_ring(bus.in_ep_drained(in_addr)))?;
+
+        if let Some(raw_cb) = self.transport.get_command() {
+            if !self.transport.has_status() {
+                let lun = raw_cb.lun;
+                let kind = parse_cb(raw_cb.bytes);
+
+                debug!("usb: scsi: Command (ring): {}", kind);
+
+                loop {
+                    callback(Command {
+                        class: self,
+                        kind,
+                        lun,
+                    });
+
+                    // Re-query drain state each pass: the callback may have primed
+                    // more IN data, changing the ring occupancy.
+                    match self.transport.write_ring(bus.in_ep_drained(in_addr)) {
+                        Err(TransportError::Error(BulkOnlyError::FullPacketExpected)) => {
+                            continue;
+                        }
+                        Ok(_)
+                        | Err(TransportError::Error(_))
+                        | Err(TransportError::Usb(UsbError::WouldBlock)) => { /* ignore */ }
+                        Err(TransportError::Usb(err)) => {
+                            return Err(err);
+                        }
+                    };
+                    map_ignore(self.transport.read())?;
+
+                    break;
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 impl<Bus, T> UsbClass<Bus> for Scsi<T>
