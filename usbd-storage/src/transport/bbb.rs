@@ -516,8 +516,18 @@ where
         if self.cbw.data_transfer_len > 0 {
             match self.state {
                 State::DataTransferToHost => {
-                    //TODO: send zlp right here
-                    self.stall_in_ep();
+                    // Hi > Di (BOT 6.7.2 case 5/6): the host's allocation length is a
+                    // *maximum*; a command that succeeded with a deliberately shorter
+                    // valid response (e.g. MODE SENSE returning a 4-byte header for a
+                    // 192-byte allocation) does NOT need to halt the bulk-IN pipe — the
+                    // host accepts the short transfer and reads the CSW with residue.
+                    // Stalling here forced the host into stall recovery; on this bus
+                    // that recovery failed and the host issued a full device reset on
+                    // every MODE SENSE probe. Only halt the pipe when the command did
+                    // not pass (a genuine early termination), per spec case 7/8/12/13.
+                    if !matches!(self.cs, Some(CommandStatus::Passed)) {
+                        self.stall_in_ep();
+                    }
                 }
                 State::DataTransferFromHost => {
                     self.stall_out_ep();
