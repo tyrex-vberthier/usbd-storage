@@ -34,6 +34,7 @@ ring = ["bbb"]                            # Lever B: looping ring-filling pump
 
 [dependencies.imxrt-usbd]
 git = "https://github.com/tyrex-vberthier/imxrt-usbd"
+branch = "feat-bulk-throughput"   # the branch carrying the bulk API (bulk_poll_complete)
 optional = true
 
 [[test]]
