@@ -1,7 +1,7 @@
 //! Bulk Only Transport (BBB/BOT)
 
 use crate::buffer::Buffer;
-use crate::fmt::{info, trace};
+use crate::fmt::{info, trace, warning};
 use crate::transport::{CommandStatus, Transport, TransportError};
 use core::borrow::BorrowMut;
 use core::cmp::min;
@@ -853,9 +853,12 @@ where
             CLASS_SPECIFIC_BULK_ONLY_MASS_STORAGE_RESET => {}
             // Spec. section 3.2
             CLASS_SPECIFIC_GET_MAX_LUN => {
-                // always respond with LUN
-                xfer.accept_with(&[self.max_lun])
-                    .expect("Failed to accept Get Max Lun!");
+                // always respond with LUN. A failure here means the host
+                // misbehaved or the bus glitched mid control-transfer; log and
+                // return rather than panicking the device.
+                if let Err(err) = xfer.accept_with(&[self.max_lun]) {
+                    warning!("usb: bbb: Get Max Lun accept failed: {}", err);
+                }
             }
             _ => {}
         }
@@ -1068,6 +1071,213 @@ mod tests {
             (DEPTH * MPS) as u32,
             sent,
             "ring pump must send DEPTH packets per poll, not one"
+        );
+    }
+
+    /// Shared inner state for `RingBulkBus`, held behind an `Arc` so both the
+    /// `UsbBusAllocator`-owned bus and the test can observe counters and mutate
+    /// `in_drained` after the allocator is frozen.
+    #[cfg(all(feature = "ring", feature = "scsi"))]
+    struct RingBulkInner {
+        /// Counts calls to `UsbBus::read` (the per-packet OUT path).
+        read_count: core::sync::atomic::AtomicUsize,
+        /// Counts calls to `BulkBus::bulk_read_prime`.
+        bulk_read_prime_count: core::sync::atomic::AtomicUsize,
+        /// Controls what `in_ep_drained` returns.
+        in_drained: core::sync::atomic::AtomicBool,
+    }
+
+    /// A stub bus that implements BOTH `UsbBus` and `BulkBus`.  The counters and
+    /// control flags live in `Arc<RingBulkInner>` so tests can inspect them without
+    /// needing to reach through the frozen `UsbBusAllocator`.
+    #[cfg(all(feature = "ring", feature = "scsi"))]
+    struct RingBulkBus(std::sync::Arc<RingBulkInner>);
+
+    #[cfg(all(feature = "ring", feature = "scsi"))]
+    impl UsbBus for RingBulkBus {
+        fn alloc_ep(
+            &mut self,
+            _d: UsbDirection,
+            _a: Option<EndpointAddress>,
+            _t: EndpointType,
+            _m: u16,
+            _i: u8,
+        ) -> usb_device::Result<EndpointAddress> {
+            Ok(EndpointAddress::from(0))
+        }
+        fn enable(&mut self) {}
+        fn reset(&self) {}
+        fn set_device_address(&self, _a: u8) {}
+        fn write(&self, _ep: EndpointAddress, buf: &[u8]) -> usb_device::Result<usize> {
+            // Accept any write (used for CSW serialization via write_packet).
+            Ok(buf.len())
+        }
+        fn read(&self, _ep: EndpointAddress, _buf: &mut [u8]) -> usb_device::Result<usize> {
+            // Count per-packet OUT reads (should be skipped during bulk OUT phase).
+            self.0
+                .read_count
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            Err(UsbError::WouldBlock)
+        }
+        fn set_stalled(&self, _e: EndpointAddress, _s: bool) {}
+        fn is_stalled(&self, _e: EndpointAddress) -> bool {
+            false
+        }
+        fn suspend(&self) {}
+        fn resume(&self) {}
+        fn poll(&self) -> usb_device::bus::PollResult {
+            usb_device::bus::PollResult::None
+        }
+    }
+
+    #[cfg(all(feature = "ring", feature = "scsi"))]
+    impl BulkBus for RingBulkBus {
+        fn bulk_write(&self, _ep: EndpointAddress, buf: &[u8]) -> Result<usize, UsbError> {
+            Ok(buf.len())
+        }
+
+        fn bulk_read_prime(&self, _ep: EndpointAddress, _buf: &mut [u8]) -> Result<(), UsbError> {
+            self.0
+                .bulk_read_prime_count
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn bulk_poll(&self, _ep: EndpointAddress) -> Option<usize> {
+            // Simulate immediate completion so bulk_read_data succeeds on second call.
+            Some(512)
+        }
+
+        fn in_ep_drained(&self, _ep: EndpointAddress) -> bool {
+            self.0
+                .in_drained
+                .load(core::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    /// `poll_ring_bulk` must skip the per-packet `read()` (UsbBus::read) while the
+    /// transport is in the DataTransferFromHost (bulk OUT) phase, and the callback's
+    /// `bulk_read_data` call must reach `bulk_read_prime`.
+    #[cfg(all(feature = "ring", feature = "scsi"))]
+    #[test]
+    fn poll_ring_bulk_skips_read_during_bulk_out() {
+        use super::DataDirection;
+        use crate::subclass::scsi::Scsi;
+        use crate::transport::bbb::State::DataTransferFromHost;
+        use usb_device::device::{UsbDeviceBuilder, UsbVidPid};
+
+        const MPS: usize = 64;
+        const BUF: usize = 512;
+        const CHUNK: usize = 512;
+
+        let inner = std::sync::Arc::new(RingBulkInner {
+            read_count: core::sync::atomic::AtomicUsize::new(0),
+            bulk_read_prime_count: core::sync::atomic::AtomicUsize::new(0),
+            in_drained: core::sync::atomic::AtomicBool::new(true),
+        });
+        let alloc = UsbBusAllocator::new(RingBulkBus(std::sync::Arc::clone(&inner)));
+        let mut scsi = Scsi::new(&alloc, MPS as u16, 0, vec![0u8; BUF]).unwrap();
+        let _usb_dev = UsbDeviceBuilder::new(&alloc, UsbVidPid(0x0000, 0x0000)).build();
+
+        // Place transport in the bulk OUT (DataTransferFromHost) phase.
+        scsi.transport.state = DataTransferFromHost;
+        scsi.transport.cbw.direction = DataDirection::Out;
+        scsi.transport.cbw.data_transfer_len = CHUNK as u32;
+
+        // Fabricate a non-empty command block so get_command() returns Some and
+        // has_status() is false — causes the callback to be invoked.
+        scsi.transport.cbw.block_len = 10;
+
+        // We need a bus reference to pass to poll_ring_bulk. Since the allocator
+        // is frozen, construct a thin wrapper sharing the same Arc for calls.
+        let bus = RingBulkBus(std::sync::Arc::clone(&inner));
+        let mut dst = vec![0u8; CHUNK];
+
+        scsi.poll_ring_bulk(&bus, |mut cmd, b| {
+            // The callback invokes bulk_read_data, which calls bulk_read_prime on
+            // the first call and bulk_poll on the second.
+            let _ = cmd.bulk_read_data(b, &mut dst);
+            cmd.pass();
+        })
+        .unwrap();
+
+        let reads = inner.read_count.load(core::sync::atomic::Ordering::Relaxed);
+        let primes = inner
+            .bulk_read_prime_count
+            .load(core::sync::atomic::Ordering::Relaxed);
+
+        assert_eq!(
+            0, reads,
+            "poll_ring_bulk must not call the per-packet read() during bulk OUT phase"
+        );
+        assert!(
+            primes >= 1,
+            "callback's bulk_read_data must reach bulk_read_prime (got {})",
+            primes
+        );
+    }
+
+    /// `poll_ring_bulk` must keep the transport in `StatusTransfer` while
+    /// `in_ep_drained` returns `false`, and only advance to `Idle` once it
+    /// returns `true` — preserving BOT CSW serialization on a multi-TD ring bus.
+    #[cfg(all(feature = "ring", feature = "scsi"))]
+    #[test]
+    fn poll_ring_bulk_serializes_csw_on_in_drain() {
+        use crate::subclass::scsi::Scsi;
+        use crate::transport::bbb::State::{Idle, StatusTransfer};
+        use usb_device::device::{UsbDeviceBuilder, UsbVidPid};
+
+        const MPS: usize = 64;
+        const BUF: usize = 512;
+
+        let inner = std::sync::Arc::new(RingBulkInner {
+            read_count: core::sync::atomic::AtomicUsize::new(0),
+            bulk_read_prime_count: core::sync::atomic::AtomicUsize::new(0),
+            in_drained: core::sync::atomic::AtomicBool::new(false),
+        });
+        let alloc = UsbBusAllocator::new(RingBulkBus(std::sync::Arc::clone(&inner)));
+        let mut scsi = Scsi::new(&alloc, MPS as u16, 0, vec![0u8; BUF]).unwrap();
+        let _usb_dev = UsbDeviceBuilder::new(&alloc, UsbVidPid(0x0000, 0x0000)).build();
+
+        // Build a CSW manually: put the transport in DataTransferNoData with a status
+        // set, then call finish_bulk_out_phase() which calls check_end_data_transfer →
+        // end_data_transfer → builds the CSW and enters StatusTransfer.
+        {
+            use crate::transport::bbb::State::DataTransferNoData;
+            scsi.transport.state = DataTransferNoData;
+            scsi.transport.cbw.data_transfer_len = 0;
+            scsi.transport.cbw.block_len = 1;
+            scsi.transport.cs = Some(crate::transport::CommandStatus::Passed);
+            // finish_bulk_out_phase calls check_end_data_transfer which transitions
+            // to StatusTransfer and primes the CSW.
+            scsi.transport.finish_bulk_out_phase().ok();
+        }
+
+        // Confirm we are in StatusTransfer.
+        assert!(
+            matches!(scsi.transport.state, StatusTransfer),
+            "expected StatusTransfer after end_data_transfer"
+        );
+
+        let bus = RingBulkBus(std::sync::Arc::clone(&inner));
+
+        // Poll 1: in_ep_drained = false → must stay in StatusTransfer.
+        scsi.poll_ring_bulk(&bus, |_, _| {}).unwrap();
+        assert!(
+            matches!(scsi.transport.state, StatusTransfer),
+            "must remain in StatusTransfer while IN ring not drained"
+        );
+
+        // Flip in_ep_drained to true.
+        inner
+            .in_drained
+            .store(true, core::sync::atomic::Ordering::Relaxed);
+
+        // Poll 2: in_ep_drained = true → must advance to Idle.
+        scsi.poll_ring_bulk(&bus, |_, _| {}).unwrap();
+        assert!(
+            matches!(scsi.transport.state, Idle),
+            "must reach Idle once IN ring is drained"
         );
     }
 
