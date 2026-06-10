@@ -5,12 +5,12 @@ use crate::fmt::{info, trace, warning};
 use crate::transport::{CommandStatus, Transport, TransportError};
 use core::borrow::BorrowMut;
 use core::cmp::min;
+use usb_device::UsbError;
 use usb_device::bus::{UsbBus, UsbBusAllocator};
 use usb_device::class::ControlIn;
 use usb_device::class_prelude::DescriptorWriter;
 use usb_device::control::{Recipient, RequestType};
 use usb_device::endpoint::{Endpoint, In, Out};
-use usb_device::UsbError;
 
 /// Bulk Only Transport interface protocol
 pub(crate) const TRANSPORT_BBB: u8 = 0x50;
@@ -493,18 +493,16 @@ where
 
     fn check_end_data_transfer(&mut self) -> BulkOnlyTransportResult<()> {
         match self.state {
-            State::DataTransferNoData | State::DataTransferFromHost => {
+            State::DataTransferNoData | State::DataTransferFromHost
                 // command is passed or failed. IO buffer is irrelevant. end data transfer
-                if self.cs.is_some() {
+                if self.cs.is_some() => {
                     self.end_data_transfer()?;
                 }
-            }
-            State::DataTransferToHost => {
+            State::DataTransferToHost
                 // command is passed or failed. empty IO buffer first. if empty, end data transfer
-                if self.cs.is_some() && self.buf.available_read() == 0 {
+                if self.cs.is_some() && self.buf.available_read() == 0 => {
                     self.end_data_transfer()?;
                 }
-            }
             _ => {}
         }
 
