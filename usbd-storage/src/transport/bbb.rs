@@ -2,6 +2,8 @@
 
 use crate::buffer::Buffer;
 use crate::fmt::{info, trace};
+#[cfg(feature = "transfer")]
+use crate::transfer::TransferBus;
 use crate::transport::{CommandStatus, Transport, TransportError};
 use core::borrow::BorrowMut;
 use core::cmp::min;
@@ -93,6 +95,16 @@ pub struct BulkOnly<'alloc, Bus: UsbBus, Buf: BorrowMut<[u8]>> {
     cbw: CommandBlockWrapper,
     cs: Option<CommandStatus>,
     max_lun: u8,
+    /// Whether a submitted transfer has not yet been retired via `poll_transfer`.
+    /// Set on first `write_data_transfer*` / `read_data_transfer` call, cleared
+    /// once `poll_transfer` returns `Some(_)`.
+    #[cfg(feature = "transfer")]
+    transfer_in_flight: bool,
+    /// True when the callback is driving this data phase via zero-copy transfers
+    /// (`write_data_transfer*` / `read_data_transfer`).  Set on the first such
+    /// call, cleared in `end_data_transfer` and `reset()`.
+    #[cfg(feature = "transfer")]
+    transfer_phase: bool,
 }
 
 impl<'alloc, Bus, Buf> BulkOnly<'alloc, Bus, Buf>
@@ -142,6 +154,10 @@ where
             cbw: Default::default(),
             cs: Default::default(),
             max_lun,
+            #[cfg(feature = "transfer")]
+            transfer_in_flight: false,
+            #[cfg(feature = "transfer")]
+            transfer_phase: false,
         })
     }
 
@@ -158,7 +174,19 @@ where
     pub fn write(&mut self) -> BulkOnlyTransportResult<()> {
         match self.state {
             State::StatusTransfer => self.handle_write_csw(),
-            State::DataTransferToHost => self.handle_write_to_host(),
+            State::DataTransferToHost => {
+                // When the callback drives the IN data phase via zero-copy transfers
+                // (write_data_transfer / write_data_transfer_pipelined), self.buf is
+                // empty and data bypasses the staging buffer entirely.  Skip the
+                // per-packet write and run check_end_data_transfer directly so the
+                // state machine can advance to StatusTransfer once the callback sets
+                // a status and the transfer completes.
+                #[cfg(feature = "transfer")]
+                if self.transfer_phase {
+                    return self.check_end_data_transfer();
+                }
+                self.handle_write_to_host()
+            }
             State::DataTransferNoData => self.handle_no_data_transfer(),
             _ => Ok(()),
         }
@@ -274,7 +302,220 @@ where
         self.status_present()
     }
 
+    // -----------------------------------------------------------------------
+    // Zero-copy transfer methods (feature = "transfer")
+    // -----------------------------------------------------------------------
+
+    /// Zero-copy data-IN phase: submit `src` as one transfer on first call,
+    /// poll for retirement on subsequent calls.
+    ///
+    /// Returns the byte count once the transfer is retired; returns
+    /// `WouldBlock` while the transfer is in flight.  Updates the data-phase
+    /// residue exactly like [`write_data`](Self::write_data) does.
+    ///
+    /// # Errors
+    /// * `TransportError::Usb(WouldBlock)` — transfer primed or still in flight.
+    /// * `TransportError::Error(InvalidState)` — not in the IN data-transfer state.
+    #[cfg(feature = "transfer")]
+    pub fn write_data_transfer<B: TransferBus>(
+        &mut self,
+        bus: &B,
+        src: &[u8],
+    ) -> BulkOnlyTransportResult<usize> {
+        if !matches!(self.state, State::DataTransferToHost) {
+            return Err(TransportError::Error(BulkOnlyError::InvalidState));
+        }
+
+        let len = min(src.len(), self.cbw.data_transfer_len as usize);
+        let src = &src[..len];
+
+        if !self.transfer_in_flight {
+            // The callback is driving this data phase via zero-copy transfers.
+            // Set BEFORE the submit attempt: if the submit returns WouldBlock
+            // (driver TD budget momentarily full), `write()` must still skip
+            // `handle_write_to_host` — otherwise its empty-IO-buffer
+            // `FullPacketExpected` error makes `poll_inner` loop the callback
+            // forever inside one poll (HW-observed ISR wedge, 2026-06-10).
+            // The next poll simply retries the submit.
+            self.transfer_phase = true;
+            // First call: prime the IN transfer and return WouldBlock.
+            bus.submit_write(self.in_ep.address(), src)
+                .map_err(TransportError::Usb)?;
+            self.transfer_in_flight = true;
+            return Err(TransportError::Usb(UsbError::WouldBlock));
+        }
+
+        // Subsequent calls: poll for completion.
+        match bus.poll_transfer(self.in_ep.address()) {
+            None => Err(TransportError::Usb(UsbError::WouldBlock)),
+            Some(Err(e)) => {
+                self.transfer_in_flight = false;
+                Err(TransportError::Usb(e))
+            }
+            Some(Ok(n)) => {
+                self.transfer_in_flight = false;
+                self.cbw.data_transfer_len = self.cbw.data_transfer_len.saturating_sub(n as u32);
+                trace!(
+                    "usb: bbb: write_data_transfer: {} bytes, residue: {}",
+                    n, self.cbw.data_transfer_len
+                );
+                Ok(n)
+            }
+        }
+    }
+
+    /// Zero-copy data-OUT phase: prime `dst` for one transfer on first call,
+    /// poll for retirement on subsequent calls.
+    ///
+    /// Returns the byte count once the transfer is retired; returns
+    /// `WouldBlock` while the transfer is in flight.  Updates the data-phase
+    /// residue exactly like [`read_data`](Self::read_data) does.
+    ///
+    /// The caller **must** pass the same `dst` slice on every call for a given
+    /// data phase — the slice must remain valid and unmodified until `Ok` is
+    /// returned.
+    ///
+    /// # Errors
+    /// * `TransportError::Usb(WouldBlock)` — transfer primed or still in flight.
+    /// * `TransportError::Error(InvalidState)` — not in the OUT data-transfer state.
+    #[cfg(feature = "transfer")]
+    pub fn read_data_transfer<B: TransferBus>(
+        &mut self,
+        bus: &B,
+        dst: &mut [u8],
+    ) -> BulkOnlyTransportResult<usize> {
+        if !matches!(self.state, State::DataTransferFromHost) {
+            return Err(TransportError::Error(BulkOnlyError::InvalidState));
+        }
+
+        if !self.transfer_in_flight {
+            // Set BEFORE the submit attempt (see write_data_transfer): a
+            // WouldBlock submit must leave the phase in transfer mode so the
+            // poll loop retries instead of colliding per-packet reads.
+            self.transfer_phase = true;
+            // Clamp to the announced transfer length so we never consume more
+            // than the host promised.
+            let want = min(dst.len(), self.cbw.data_transfer_len as usize);
+            bus.submit_read(self.out_ep.address(), &mut dst[..want])
+                .map_err(TransportError::Usb)?;
+            self.transfer_in_flight = true;
+            return Err(TransportError::Usb(UsbError::WouldBlock));
+        }
+
+        // Subsequent calls: poll for completion.
+        match bus.poll_transfer(self.out_ep.address()) {
+            None => Err(TransportError::Usb(UsbError::WouldBlock)),
+            Some(Err(e)) => {
+                self.transfer_in_flight = false;
+                Err(TransportError::Usb(e))
+            }
+            Some(Ok(n)) => {
+                self.transfer_in_flight = false;
+                self.cbw.data_transfer_len = self.cbw.data_transfer_len.saturating_sub(n as u32);
+                trace!(
+                    "usb: bbb: read_data_transfer: {} bytes, residue: {}",
+                    n, self.cbw.data_transfer_len
+                );
+                Ok(n)
+            }
+        }
+    }
+
+    /// Submit `src` as a pipelined IN transfer without waiting for the previous
+    /// one to retire (FIFO order; driver returns `WouldBlock` when its transfer
+    /// budget is full).
+    ///
+    /// Sets `transfer_phase` on the first call so the ordinary per-packet write
+    /// path is skipped while the zero-copy data phase is active.
+    ///
+    /// Returns `()` on successful submission; callers should drain completed
+    /// transfers via [`poll_data_transfer`](Self::poll_data_transfer) to free
+    /// driver queue slots.
+    ///
+    /// # Errors
+    /// * `TransportError::Usb(WouldBlock)` — driver queue full; drain first.
+    /// * `TransportError::Error(InvalidState)` — not in the IN data-transfer state.
+    #[cfg(feature = "transfer")]
+    pub fn write_data_transfer_pipelined<B: TransferBus>(
+        &mut self,
+        bus: &B,
+        src: &[u8],
+    ) -> BulkOnlyTransportResult<()> {
+        if !matches!(self.state, State::DataTransferToHost) {
+            return Err(TransportError::Error(BulkOnlyError::InvalidState));
+        }
+
+        let len = min(src.len(), self.cbw.data_transfer_len as usize);
+        let src = &src[..len];
+
+        // Set BEFORE the submit attempt (see write_data_transfer): a WouldBlock
+        // submit must not fall back to the per-packet write path.
+        self.transfer_phase = true;
+        bus.submit_write(self.in_ep.address(), src)
+            .map_err(TransportError::Usb)?;
+        Ok(())
+    }
+
+    /// Retire at most one previously pipelined IN transfer.
+    ///
+    /// Returns `Ok(Some(n))` when a transfer completes with `n` bytes, updating
+    /// the residue.  Returns `Ok(None)` when no transfer has completed yet.
+    ///
+    /// # Errors
+    /// * `TransportError::Usb(_)` — hardware error on the retired transfer.
+    /// * `TransportError::Error(InvalidState)` — not in the IN data-transfer state.
+    #[cfg(feature = "transfer")]
+    pub fn poll_data_transfer<B: TransferBus>(
+        &mut self,
+        bus: &B,
+    ) -> BulkOnlyTransportResult<Option<usize>> {
+        if !matches!(self.state, State::DataTransferToHost) {
+            return Err(TransportError::Error(BulkOnlyError::InvalidState));
+        }
+
+        match bus.poll_transfer(self.in_ep.address()) {
+            None => Ok(None),
+            Some(Err(e)) => Err(TransportError::Usb(e)),
+            Some(Ok(n)) => {
+                self.cbw.data_transfer_len = self.cbw.data_transfer_len.saturating_sub(n as u32);
+                trace!(
+                    "usb: bbb: poll_data_transfer: {} bytes, residue: {}",
+                    n, self.cbw.data_transfer_len
+                );
+                Ok(Some(n))
+            }
+        }
+    }
+
+    /// Finalize a transfer-driven data phase: when the callback has set a
+    /// command status (and no transfer is in flight), run
+    /// `check_end_data_transfer` to advance the state machine from `Data*` to
+    /// `StatusTransfer`.
+    ///
+    /// This is the OUT-phase mirror of the per-packet `handle_read_from_host`
+    /// tail, omitting the colliding `read_packet` so the CSW is built and
+    /// flushed after the bulk transfer has moved all the data.
+    #[cfg(feature = "transfer")]
+    pub fn finish_data_transfer_phase(&mut self) -> BulkOnlyTransportResult<()> {
+        self.check_end_data_transfer()
+    }
+
+    /// Returns `true` while the OUT data phase is being driven by the callback
+    /// via zero-copy transfers (`read_data_transfer`).
+    ///
+    /// `poll_transfer` uses this to skip the ordinary per-packet `read()` while
+    /// a large OUT transfer owns the endpoint — a colliding `read_packet` would
+    /// re-prime the endpoint with a small staging buffer, blocking the bulk
+    /// transfer and consuming the host's data into the wrong buffer.
+    #[cfg(feature = "transfer")]
+    pub(crate) fn is_data_transfer_phase(&self) -> bool {
+        matches!(self.state, State::DataTransferFromHost) && self.transfer_phase
+    }
+
     fn handle_read_cbw(&mut self) -> BulkOnlyTransportResult<()> {
+        // CBW lazily primes one staging transfer here when the class polls while
+        // Idle.  This means the CBW is effectively re-primed right after CSW
+        // completion, killing most of the NAK window by construction.
         self.read_packet()?; // propagate if error or WouldBlock
 
         if self.buf.available_read() >= CBW_LEN {
@@ -382,7 +623,17 @@ where
             }
         }
 
+        // Clear transfer state before moving to the status phase.
+        #[cfg(feature = "transfer")]
+        {
+            self.transfer_in_flight = false;
+            self.transfer_phase = false;
+        }
+
         // write CSW into buffer
+        // CSW serialization is structural when using TransferBus: the driver's
+        // depth-1 IN queue makes later IN submits return WouldBlock until the
+        // CSW retires, so the next command cannot be primed ahead of this CSW.
         let csw = self.build_csw().unwrap();
         self.buf.clean();
         self.buf.write(csw.as_slice());
@@ -554,6 +805,11 @@ where
         info!("usb: bbb: Recv reset");
         self.in_ep.unstall();
         self.out_ep.unstall();
+        #[cfg(feature = "transfer")]
+        {
+            self.transfer_in_flight = false;
+            self.transfer_phase = false;
+        }
         self.enter_state(State::Idle);
     }
 
@@ -679,5 +935,94 @@ mod tests {
         bbb.buf.write([0xFFu8; BUF_SIZE].as_slice()); // fill the buffer
 
         assert_eq!(N, bbb.read_data([0u8; N].as_mut_slice()).unwrap());
+    }
+
+    /// A [`DummyBus`]-alike whose `TransferBus` submit methods always return
+    /// `WouldBlock` (driver TD budget full), for the submit-refused corner.
+    #[cfg(feature = "transfer")]
+    struct WouldBlockTransferBus;
+
+    #[cfg(feature = "transfer")]
+    impl UsbBus for WouldBlockTransferBus {
+        fn alloc_ep(
+            &mut self,
+            ep_dir: UsbDirection,
+            _ep_addr: Option<EndpointAddress>,
+            _ep_type: EndpointType,
+            _max_packet_size: u16,
+            _interval: u8,
+        ) -> usb_device::Result<EndpointAddress> {
+            Ok(EndpointAddress::from_parts(1, ep_dir))
+        }
+        fn enable(&mut self) {}
+        fn reset(&self) {}
+        fn set_device_address(&self, _addr: u8) {}
+        fn write(&self, _ep_addr: EndpointAddress, buf: &[u8]) -> usb_device::Result<usize> {
+            Ok(buf.len())
+        }
+        fn read(&self, _ep_addr: EndpointAddress, _buf: &mut [u8]) -> usb_device::Result<usize> {
+            Err(UsbError::WouldBlock)
+        }
+        fn set_stalled(&self, _ep_addr: EndpointAddress, _stalled: bool) {}
+        fn is_stalled(&self, _ep_addr: EndpointAddress) -> bool {
+            false
+        }
+        fn suspend(&self) {}
+        fn resume(&self) {}
+        fn poll(&self) -> PollResult {
+            PollResult::None
+        }
+    }
+
+    #[cfg(feature = "transfer")]
+    impl crate::transfer::TransferBus for WouldBlockTransferBus {
+        fn submit_write(&self, _ep: EndpointAddress, _buf: &[u8]) -> usb_device::Result<()> {
+            Err(UsbError::WouldBlock)
+        }
+        fn submit_read(&self, _ep: EndpointAddress, _buf: &mut [u8]) -> usb_device::Result<()> {
+            Err(UsbError::WouldBlock)
+        }
+        fn poll_transfer(&self, _ep: EndpointAddress) -> Option<usb_device::Result<usize>> {
+            None
+        }
+    }
+
+    /// Regression for the chain MSC ISR wedge (HW, 2026-06-10, cycle 2): when
+    /// the zero-copy submit is refused with `WouldBlock` (driver TD budget
+    /// momentarily full), the data phase must STAY in transfer mode. Pre-fix,
+    /// `transfer_phase` was only set after a successful submit, so the
+    /// subsequent `write()` ran `handle_write_to_host` on an empty IO buffer →
+    /// `Err(FullPacketExpected)` → `Scsi::poll_inner` looped the callback
+    /// forever inside one poll, starving EP0 until the device fell off the bus.
+    #[cfg(feature = "transfer")]
+    #[test]
+    fn wouldblock_submit_keeps_transfer_phase_no_fullpacket_spin() {
+        use crate::transport::TransportError;
+        use usb_device::device::{UsbDeviceBuilder, UsbVidPid};
+
+        let alloc = UsbBusAllocator::new(WouldBlockTransferBus);
+        let mut bbb = BulkOnly::new(&alloc, 64, 0, vec![0u8; 512]).unwrap();
+        let _usb_dev = UsbDeviceBuilder::new(&alloc, UsbVidPid(0x0000, 0x0000)).build();
+
+        // IN data phase for a 512-byte READ; no status yet.
+        bbb.state = crate::transport::bbb::State::DataTransferToHost;
+        bbb.cbw.data_transfer_len = 512;
+
+        // First callback call: the submit is refused with WouldBlock.
+        let src = [0u8; 512];
+        let r = bbb.write_data_transfer(&WouldBlockTransferBus, &src);
+        assert!(
+            matches!(r, Err(TransportError::Usb(UsbError::WouldBlock))),
+            "refused submit must surface WouldBlock, got {r:?}"
+        );
+
+        // The poll loop then drives write(): it must NOT degenerate into
+        // FullPacketExpected (the pre-fix infinite-callback-loop trigger);
+        // the phase stays in transfer mode and the next poll retries.
+        let w = bbb.write();
+        assert!(
+            w.is_ok(),
+            "write() after a WouldBlock submit must be a quiet no-op, got {w:?}"
+        );
     }
 }

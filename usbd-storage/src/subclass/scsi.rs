@@ -261,6 +261,57 @@ impl<'alloc, Bus: UsbBus + 'alloc, Buf: BorrowMut<[u8]>> Scsi<BulkOnly<'alloc, B
     }
 }
 
+/// SCSI subclass implementation with [Bulk Only Transport] — `transfer` feature extension
+///
+/// [Bulk Only Transport]: crate::transport::bbb::BulkOnly
+#[cfg(all(feature = "bbb", feature = "transfer"))]
+impl<'alloc, Bus, Buf> Scsi<BulkOnly<'alloc, Bus, Buf>>
+where
+    Bus: UsbBus + crate::transfer::TransferBus + 'alloc,
+    Buf: BorrowMut<[u8]>,
+{
+    /// Transfer-based poll: per-packet CBW/CSW/SPC, zero-copy bulk data phases
+    /// driven by the callback through
+    /// [`Command::read_data_transfer`] / [`Command::write_data_transfer`].
+    ///
+    /// During the OUT (host→device) data phase the callback owns the OUT
+    /// endpoint via a single large transfer.  The per-packet `read()` path is
+    /// skipped while that transfer is in flight so it cannot collide with the
+    /// zero-copy prime.  The IN data phase and CBW/CSW phases use the normal
+    /// per-packet path.
+    pub fn poll_transfer<F>(&mut self, bus: &Bus, mut callback: F) -> Result<(), UsbError>
+    where
+        F: FnMut(Command<ScsiCommand, Scsi<BulkOnly<'alloc, Bus, Buf>>>, &Bus),
+    {
+        self.poll_inner(
+            // Pre-read: skip the per-packet OUT read while the callback's zero-copy
+            // OUT transfer owns the endpoint (no-swallow rule).
+            |t| {
+                if t.is_data_transfer_phase() {
+                    Ok(())
+                } else {
+                    t.read()
+                }
+            },
+            // Write: ordinary per-packet IN / CSW path.  The transfer_phase guard
+            // inside write() handles the zero-copy IN case automatically.
+            |t| t.write(),
+            // Post-read: advance the OUT data phase to StatusTransfer once the
+            // callback has set a status, WITHOUT a colliding per-packet read.
+            |t| {
+                if t.is_data_transfer_phase() {
+                    t.finish_data_transfer_phase()
+                } else {
+                    t.read()
+                }
+            },
+            // Callback adapter: Command mutably borrows the transport; the bus
+            // is passed separately so the callback can call read/write_data_transfer.
+            |cmd| callback(cmd, bus),
+        )
+    }
+}
+
 /// Shared, panic-free `Result`-collapse used by `poll_inner`.
 ///
 /// `WouldBlock` and any transport-level `Error(_)` are non-fatal (the next

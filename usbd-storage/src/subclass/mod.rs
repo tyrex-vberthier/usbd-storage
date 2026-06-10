@@ -4,6 +4,8 @@
 use crate::subclass::scsi::{Scsi, ScsiCommand};
 #[cfg(all(feature = "bbb", feature = "ufi"))]
 use crate::subclass::ufi::{Ufi, UfiCommand};
+#[cfg(all(feature = "bbb", feature = "scsi", feature = "transfer"))]
+use crate::transfer::TransferBus;
 #[cfg(all(any(feature = "scsi", feature = "ufi"), feature = "bbb"))]
 use {
     crate::transport::bbb::{BulkOnly, BulkOnlyError},
@@ -94,5 +96,44 @@ impl<'a, 'alloc, Bus: UsbBus + 'alloc, Buf: BorrowMut<[u8]>>
 
     pub fn fail_phase(self) {
         self.class.transport.set_status(CommandStatus::PhaseError);
+    }
+
+    /// [crate::transport::bbb::BulkOnly::read_data_transfer]
+    #[cfg(feature = "transfer")]
+    pub fn read_data_transfer<B: TransferBus>(
+        &mut self,
+        bus: &B,
+        dst: &mut [u8],
+    ) -> Result<usize, TransportError<BulkOnlyError>> {
+        self.class.transport.read_data_transfer(bus, dst)
+    }
+
+    /// [crate::transport::bbb::BulkOnly::write_data_transfer]
+    #[cfg(feature = "transfer")]
+    pub fn write_data_transfer<B: TransferBus>(
+        &mut self,
+        bus: &B,
+        src: &[u8],
+    ) -> Result<usize, TransportError<BulkOnlyError>> {
+        self.class.transport.write_data_transfer(bus, src)
+    }
+
+    /// [crate::transport::bbb::BulkOnly::write_data_transfer_pipelined]
+    #[cfg(feature = "transfer")]
+    pub fn write_data_transfer_pipelined<B: TransferBus>(
+        &mut self,
+        bus: &B,
+        src: &[u8],
+    ) -> Result<(), TransportError<BulkOnlyError>> {
+        self.class.transport.write_data_transfer_pipelined(bus, src)
+    }
+
+    /// [crate::transport::bbb::BulkOnly::poll_data_transfer]
+    #[cfg(feature = "transfer")]
+    pub fn poll_data_transfer<B: TransferBus>(
+        &mut self,
+        bus: &B,
+    ) -> Result<Option<usize>, TransportError<BulkOnlyError>> {
+        self.class.transport.poll_data_transfer(bus)
     }
 }
