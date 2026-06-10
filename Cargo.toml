@@ -7,3 +7,9 @@ members = [
 
 resolver = "3"
 
+# Dev-loop patch: the imxrt-usbd dep is pinned to the fork's feat-transfer-queue
+# branch; this patch resolves it to the local clone during development
+# (memory: usb-stack-fork-dev-loop). Comment it out to build against the remote.
+[patch."https://github.com/tyrex-vberthier/imxrt-usbd"]
+imxrt-usbd = { path = "../imxrt-usbd" }
+

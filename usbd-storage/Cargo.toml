@@ -29,6 +29,14 @@ bbb = []
 ufi = []
 scsi = []
 extended_addressing = []
+transfer = []
+imxrt-transfer = ["transfer", "dep:imxrt-usbd"]
+
+[dependencies.imxrt-usbd]
+git = "https://github.com/tyrex-vberthier/imxrt-usbd"
+branch = "feat-transfer-queue"
+features = ["transfer"]
+optional = true
 
 [[test]]
 name = "scsi_bbb"
