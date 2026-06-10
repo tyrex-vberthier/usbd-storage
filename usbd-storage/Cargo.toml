@@ -31,6 +31,7 @@ scsi = []
 extended_addressing = []
 transfer = []
 imxrt-transfer = ["transfer", "dep:imxrt-usbd"]
+uas = ["bbb", "scsi", "transfer"]
 
 [dependencies.imxrt-usbd]
 git = "https://github.com/tyrex-vberthier/imxrt-usbd"
@@ -41,6 +42,9 @@ optional = true
 [[test]]
 name = "scsi_bbb"
 required-features = ["scsi", "bbb", "extended_addressing"]
+
+[dev-dependencies]
+proptest = "1.11.0"
 
 [package.metadata.docs.rs]
 all-features = true
