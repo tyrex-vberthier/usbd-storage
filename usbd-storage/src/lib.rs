@@ -31,6 +31,8 @@
 pub(crate) mod buffer;
 pub(crate) mod fmt;
 pub mod subclass;
+#[cfg(feature = "transfer")]
+pub mod transfer;
 pub mod transport;
 
 /// USB Mass Storage Class code
