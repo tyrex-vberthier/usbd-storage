@@ -33,7 +33,17 @@
 //! `9716c086c8e8b141d35aa61f2e96a2e83de212a7`).  See
 //! `.claude/reference/uas-protocol.md` for the full citation table.
 
+#[cfg(feature = "transfer")]
+use crate::fmt::trace;
 use crate::subclass::scsi::{ScsiCommand, parse_cb};
+#[cfg(feature = "transfer")]
+use crate::transfer::TransferBus;
+#[cfg(feature = "transfer")]
+use usb_device::UsbError;
+#[cfg(feature = "transfer")]
+use usb_device::bus::{UsbBus, UsbBusAllocator};
+#[cfg(feature = "transfer")]
+use usb_device::endpoint::{Endpoint, EndpointAddress, In, Out};
 
 // ---------------------------------------------------------------------------
 // Protocol constants (all from uas.h §1 / §3)
@@ -108,10 +118,10 @@ pub const RC_OVERLAPPED_TAG: u8 = 0x0a;
 
 /// A parsed UAS Command IU.
 ///
-/// Field `lun` is the first byte of the 8-byte SAM LUN field (offset 8 in
-/// the IU).  A non-zero LUN is **not** a parse error: the caller must check
-/// `lun` and, if it is unsupported, send a Response IU with
-/// [`RC_INCORRECT_LUN`].
+/// Field `lun` is the single-level LUN collapsed from the 8-byte SAM LUN
+/// field at IU offset 8 (see the field doc).  A non-zero LUN is **not** a
+/// parse error: the caller must check `lun` and, if it is unsupported, send
+/// a Response IU with [`RC_INCORRECT_LUN`].
 #[derive(Debug)]
 pub struct CommandIu {
     /// Tag (big-endian on the wire, decoded to host order here).
@@ -119,7 +129,10 @@ pub struct CommandIu {
     /// Task attribute field (`prio_attr`); Linux always sends `UAS_SIMPLE_TAG`
     /// (0).
     pub prio_attr: u8,
-    /// Logical Unit Number (byte 8 of the IU; bytes 9–15 are reserved).
+    /// Single-level Logical Unit Number (byte 9 of the IU's 8-byte SAM
+    /// peripheral-addressing LUN field; byte 8 and bytes 10–15 must be 0).
+    /// Any other encoding collapses to `u8::MAX` so single-LUN callers
+    /// reject it via the incorrect-LUN path.
     pub lun: u8,
     /// Raw 16-byte CDB (zero-padded for CDBs shorter than 16 bytes).
     pub cdb: [u8; 16],
@@ -222,10 +235,24 @@ pub fn parse_iu(raw: &[u8]) -> Result<IuParse, IuParseError> {
                 raw.get(3).copied().unwrap_or(0),
             ]);
             let prio_attr = raw.get(4).copied().unwrap_or(0);
-            // LUN field: 8 bytes at offset 8; we only use the first byte for
-            // single-LUN devices.  A non-zero value is returned to the caller,
-            // not treated as a parse error.
-            let lun = raw.get(8).copied().unwrap_or(0);
+            // LUN field: 8 bytes at offset 8, SAM peripheral addressing.
+            // Byte 8 is the address-method/bus byte (0 for a single-level
+            // LUN < 256); **byte 9 carries the LUN number**. Linux fills it
+            // via int_to_scsilun(), so LUN 1 arrives as [0x00, 0x01, 0, ..]
+            // (HW-observed 2026-06-11; reading byte 8 made every LUN parse
+            // as 0 and the host attached phantom LUNs 1-4). Any encoding
+            // other than a clean single-level LUN collapses to a non-zero
+            // sentinel so single-LUN callers reject it. A non-zero value is
+            // returned to the caller, not treated as a parse error.
+            let lun_field_clean = raw.get(8).copied().unwrap_or(0) == 0
+                && raw
+                    .get(10..16)
+                    .is_some_and(|rest| rest.iter().all(|b| *b == 0));
+            let lun = if lun_field_clean {
+                raw.get(9).copied().unwrap_or(0)
+            } else {
+                u8::MAX
+            };
             // CDB: 16 bytes at offset 16
             let mut cdb = [0u8; 16];
             if let Some(src) = raw.get(16..32) {
@@ -608,6 +635,465 @@ impl Default for TagTable {
 }
 
 // ---------------------------------------------------------------------------
+// UAS engine (feature = "transfer" / "uas")
+// ---------------------------------------------------------------------------
+
+/// A pending message for the UAS status pipe.
+///
+/// These are built by the `Uas` engine and flushed toward the host one at a
+/// time via `pump`.  Each variant corresponds to exactly one IU sent on the
+/// status pipe.
+#[cfg(feature = "transfer")]
+#[derive(Clone, Copy)]
+pub enum StatusMsg {
+    /// Read Ready — gates the host's data-IN URB for `tag`.
+    ReadReady {
+        /// UAS tag of the command.
+        tag: u16,
+    },
+    /// Write Ready — gates the host's data-OUT URB for `tag`.
+    WriteReady {
+        /// UAS tag of the command.
+        tag: u16,
+    },
+    /// SCSI GOOD status — command completed without error.
+    Good {
+        /// UAS tag of the command.
+        tag: u16,
+    },
+    /// SCSI CHECK CONDITION status with 18-byte fixed-format sense.
+    Check {
+        /// UAS tag of the command.
+        tag: u16,
+        /// Sense key (4 low bits used).
+        key: u8,
+        /// Additional Sense Code.
+        asc: u8,
+        /// Additional Sense Code Qualifier.
+        ascq: u8,
+    },
+    /// SCSI TASK SET FULL (0x28) — tag-table-full reply.
+    ///
+    /// Sent as a Status IU with status byte `SAM_STAT_TASK_SET_FULL` (0x28) and
+    /// no sense data.
+    TaskSetFull {
+        /// UAS tag of the command.
+        tag: u16,
+    },
+    /// UAS Response IU — carries a protocol-level response code (`RC_*`).
+    Response {
+        /// UAS tag of the command (or the TM request tag).
+        tag: u16,
+        /// Response code (`RC_TMF_NOT_SUPPORTED`, `RC_INCORRECT_LUN`, …).
+        code: u8,
+    },
+}
+
+/// Status-queue capacity: every in-flight tag plus a margin for protocol
+/// messages that arrive before earlier ones drain.
+#[cfg(feature = "transfer")]
+const STATUS_QUEUE_CAP: usize = UAS_QDEPTH + 4;
+
+/// Pushing into a full status queue — indicates a logic bug, since the
+/// capacity covers every tag plus margin.
+#[cfg(feature = "transfer")]
+#[derive(Debug)]
+pub struct StatusQueueFull;
+
+/// Fixed-capacity FIFO ring for pending [`StatusMsg`]s.
+///
+/// Pure (no USB bus access), host-testable.
+#[cfg(feature = "transfer")]
+struct StatusQueue {
+    /// Backing storage; `None` means the slot is empty.
+    slots: [Option<StatusMsg>; STATUS_QUEUE_CAP],
+    /// Index of the oldest slot in `slots`.
+    head: usize,
+    /// Number of occupied slots.
+    len: usize,
+}
+
+#[cfg(feature = "transfer")]
+impl StatusQueue {
+    /// Create an empty queue.
+    const fn new() -> Self {
+        // `Option<StatusMsg>` is not `Copy` due to enum, so manual const init.
+        Self {
+            slots: [
+                None, None, None, None, None, None, None, None, None, None, None, None, None, None,
+                None, None, None, None, None, None, None, None, None, None, None, None, None, None,
+                None, None, None, None, None, None, None, None,
+            ],
+            head: 0,
+            len: 0,
+        }
+    }
+
+    /// Enqueue a message at the tail.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StatusQueueFull`] when the queue already holds
+    /// `STATUS_QUEUE_CAP` messages — this indicates a logic bug in the caller
+    /// since the capacity is sized to exceed the maximum number of in-flight
+    /// tags.
+    fn push(&mut self, msg: StatusMsg) -> Result<(), StatusQueueFull> {
+        if self.len >= STATUS_QUEUE_CAP {
+            return Err(StatusQueueFull);
+        }
+        let tail = (self.head + self.len) % STATUS_QUEUE_CAP;
+        if let Some(slot) = self.slots.get_mut(tail) {
+            *slot = Some(msg);
+        }
+        self.len = self.len.saturating_add(1);
+        Ok(())
+    }
+
+    /// Peek at the head message without removing it.
+    ///
+    /// Returns `None` if the queue is empty.
+    fn peek(&self) -> Option<&StatusMsg> {
+        if self.len == 0 {
+            return None;
+        }
+        self.slots
+            .get(self.head % STATUS_QUEUE_CAP)
+            .and_then(Option::as_ref)
+    }
+
+    /// Remove and return the head message.
+    ///
+    /// Returns `None` if the queue is empty.
+    fn pop(&mut self) -> Option<StatusMsg> {
+        if self.len == 0 {
+            return None;
+        }
+        let idx = self.head % STATUS_QUEUE_CAP;
+        let msg = self.slots.get_mut(idx).and_then(Option::take);
+        self.head = (self.head + 1) % STATUS_QUEUE_CAP;
+        self.len = self.len.saturating_sub(1);
+        msg
+    }
+
+    /// Return `true` if no messages are pending.
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Discard all pending messages.
+    fn clear(&mut self) {
+        for slot in self.slots.iter_mut() {
+            *slot = None;
+        }
+        self.head = 0;
+        self.len = 0;
+    }
+}
+
+/// UAS transport engine.
+///
+/// `Uas` owns the two UAS-exclusive bulk endpoints (command OUT, status IN) and
+/// stores the addresses of the shared data endpoints (bulk IN/OUT) that are also
+/// used by [`BulkOnly`] in alt-0.
+///
+/// # Ordering invariant
+///
+/// RRDY/WRDY messages are enqueued in the same order their data phases are
+/// submitted on the shared data pipes.  Because both the status queue and the
+/// USB bulk pipe are FIFOs, the host observes ready-IU order == data-submit
+/// order, satisfying the HS sequencing rule (§7 of the protocol reference).
+///
+/// [`BulkOnly`]: crate::transport::bbb::BulkOnly
+#[cfg(feature = "transfer")]
+pub struct Uas<'alloc, Bus: UsbBus> {
+    /// Command pipe: bulk OUT, host → device.
+    cmd_ep: Endpoint<'alloc, Bus, Out>,
+    /// Status pipe: bulk IN, device → host.
+    status_ep: Endpoint<'alloc, Bus, In>,
+    /// Address of the shared data-IN endpoint (reuses BOT bulk IN).
+    data_in: EndpointAddress,
+    /// Address of the shared data-OUT endpoint (reuses BOT bulk OUT).
+    data_out: EndpointAddress,
+    /// In-flight command tag table.
+    pub table: TagTable,
+    /// Pending status-pipe messages.
+    status_q: StatusQueue,
+}
+
+#[cfg(feature = "transfer")]
+impl<'alloc, Bus: UsbBus> Uas<'alloc, Bus> {
+    /// Allocate the UAS-exclusive endpoints and create the engine.
+    ///
+    /// `data_in` and `data_out` are the endpoint addresses of the BOT bulk
+    /// endpoints that are shared with the alt-0 setting; they are stored here
+    /// so `pump` can drive data-phase transfers on them.
+    pub(crate) fn new(
+        alloc: &'alloc UsbBusAllocator<Bus>,
+        packet_size: u16,
+        data_in: EndpointAddress,
+        data_out: EndpointAddress,
+    ) -> Self {
+        Self {
+            // Command pipe: host sends Command IUs / Task Mgmt IUs here.
+            cmd_ep: alloc.bulk(packet_size),
+            // Status pipe: device sends RRDY/WRDY/Status/Response IUs here.
+            status_ep: alloc.bulk(packet_size),
+            data_in,
+            data_out,
+            table: TagTable::new(),
+            status_q: StatusQueue::new(),
+        }
+    }
+
+    /// Drive the UAS engine one step.
+    ///
+    /// * Reads one command-pipe packet and dispatches it:
+    ///   - Command IU, LUN 0 → insert into the tag table; on collision push
+    ///     `Response { RC_OVERLAPPED_TAG }`; on full push `TaskSetFull`.
+    ///   - Command IU, LUN ≠ 0 → push `Response { RC_INCORRECT_LUN }`.
+    ///   - Task Management IU → push `Response { RC_TMF_NOT_SUPPORTED }`.
+    ///   - Parse error → logged at TRACE level, packet dropped.
+    /// * Drains pending status-queue entries onto the status pipe until the
+    ///   queue is empty or the endpoint reports `WouldBlock`.
+    pub fn pump(&mut self) {
+        self.pump_cmd_pipe();
+        self.drain_status();
+    }
+
+    /// Drain queued status-pipe messages onto the status endpoint.
+    ///
+    /// Sends from the FIFO head until the queue is empty or the endpoint
+    /// reports `WouldBlock` (the entry is kept and retried on the next
+    /// drain).
+    ///
+    /// Callers MUST invoke this after every batch of [`Self::enqueue_status`]
+    /// calls made outside `pump` (e.g. at the end of an ISR service pass).
+    /// The host only NAK-polls the status pipe while waiting for a
+    /// ready/status IU, and NAKed polls raise no interrupt — a message left
+    /// in the queue "until the next pump" therefore deadlocks the link
+    /// (observed on hardware 2026-06-11: INQUIRY accepted and staged, RRDY
+    /// enqueued but never written, no further interrupt arrived, host reset
+    /// the device after 20 s).
+    pub fn drain_status(&mut self) {
+        while let Some(msg) = self.status_q.peek().copied() {
+            if self.try_send_msg(msg) {
+                self.status_q.pop();
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Read one packet from the command pipe and dispatch it.
+    fn pump_cmd_pipe(&mut self) {
+        let mut buf = [0u8; 32];
+        match self.cmd_ep.read(&mut buf) {
+            Ok(n) => {
+                let raw = buf.get(..n).unwrap_or(&buf[..0]);
+                self.dispatch_cmd(raw);
+            }
+            Err(UsbError::WouldBlock) => { /* nothing ready yet */ }
+            Err(_e) => {
+                trace!("uas: cmd pipe read error");
+            }
+        }
+    }
+
+    /// Dispatch a raw command-pipe packet.
+    fn dispatch_cmd(&mut self, raw: &[u8]) {
+        use crate::transport::uas::{IuParse, parse_iu};
+        match parse_iu(raw) {
+            Ok(IuParse::Command(iu)) => {
+                if iu.lun != 0 {
+                    trace!("uas: incorrect LUN {}", iu.lun);
+                    let _ = self.status_q.push(StatusMsg::Response {
+                        tag: iu.tag,
+                        code: RC_INCORRECT_LUN,
+                    });
+                    return;
+                }
+                let kind = iu.parse_kind();
+                match self.table.insert(iu.tag, iu.lun, kind) {
+                    Ok(()) => {
+                        trace!("uas: inserted tag {}", iu.tag);
+                    }
+                    Err(crate::transport::uas::InsertError::Overlapped) => {
+                        trace!("uas: overlapped tag {}", iu.tag);
+                        let _ = self.status_q.push(StatusMsg::Response {
+                            tag: iu.tag,
+                            code: RC_OVERLAPPED_TAG,
+                        });
+                    }
+                    Err(crate::transport::uas::InsertError::Full) => {
+                        trace!("uas: tag table full, tag {}", iu.tag);
+                        let _ = self.status_q.push(StatusMsg::TaskSetFull { tag: iu.tag });
+                    }
+                }
+            }
+            Ok(IuParse::TaskMgmt(tm)) => {
+                trace!("uas: task mgmt IU, function {}", tm.function);
+                let _ = self.status_q.push(StatusMsg::Response {
+                    tag: tm.tag,
+                    code: RC_TMF_NOT_SUPPORTED,
+                });
+            }
+            Err(_e) => {
+                trace!("uas: cmd pipe parse error");
+            }
+        }
+    }
+
+    /// Encode `msg` and write it on the status pipe via the **packet
+    /// (staging) path** — `Endpoint::write`, NOT the zero-copy
+    /// `TransferBus::submit_write`.
+    ///
+    /// The packet path copies the IU into the driver's staging buffer, so
+    /// the stack-local IU bytes need not outlive this call, and the driver
+    /// auto-reaps retired fire-and-forget staging records on the next write.
+    /// The zero-copy path is wrong here on both counts: its records must be
+    /// retired via `poll_transfer` (which no one calls for the status pipe —
+    /// HW-observed 2026-06-11: `tds_in_use` climbed 6→7→8 then permanent
+    /// `WouldBlock`, muting the status pipe after ~8 IUs), and it DMAs the
+    /// caller's buffer after the stack frame is gone.
+    ///
+    /// Returns `true` if the write was accepted; `false` on `WouldBlock`
+    /// (caller keeps the message and retries next drain).
+    fn try_send_msg(&self, msg: StatusMsg) -> bool {
+        /// SAM SCSI status: GOOD.
+        const SAM_STAT_GOOD: u8 = 0x00;
+        /// SAM SCSI status: CHECK CONDITION.
+        const SAM_STAT_CHECK_CONDITION: u8 = 0x02;
+        /// SAM SCSI status: TASK SET FULL.
+        const SAM_STAT_TASK_SET_FULL: u8 = 0x28;
+
+        match msg {
+            StatusMsg::ReadReady { tag } => {
+                let iu = build_ready_iu(true, tag);
+                self.status_ep.write(&iu).is_ok()
+            }
+            StatusMsg::WriteReady { tag } => {
+                let iu = build_ready_iu(false, tag);
+                self.status_ep.write(&iu).is_ok()
+            }
+            StatusMsg::Good { tag } => {
+                let (iu, used) = build_status_iu(tag, SAM_STAT_GOOD, &[]);
+                let bytes = iu.get(..used).unwrap_or(&iu[..STATUS_IU_HDR_LEN]);
+                self.status_ep.write(bytes).is_ok()
+            }
+            StatusMsg::Check {
+                tag,
+                key,
+                asc,
+                ascq,
+            } => {
+                let sense = fixed_sense(key, asc, ascq);
+                let (iu, used) = build_status_iu(tag, SAM_STAT_CHECK_CONDITION, &sense);
+                let bytes = iu.get(..used).unwrap_or(&iu[..STATUS_IU_HDR_LEN]);
+                self.status_ep.write(bytes).is_ok()
+            }
+            StatusMsg::TaskSetFull { tag } => {
+                let (iu, used) = build_status_iu(tag, SAM_STAT_TASK_SET_FULL, &[]);
+                let bytes = iu.get(..used).unwrap_or(&iu[..STATUS_IU_HDR_LEN]);
+                self.status_ep.write(bytes).is_ok()
+            }
+            StatusMsg::Response { tag, code } => {
+                let iu = build_response_iu(tag, code);
+                self.status_ep.write(&iu).is_ok()
+            }
+        }
+    }
+
+    /// Enqueue a [`StatusMsg`] for later transmission on the status pipe.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StatusQueueFull`] only on a logic bug; the queue capacity
+    /// covers every possible in-flight tag plus a margin.
+    pub fn enqueue_status(&mut self, msg: StatusMsg) -> Result<(), StatusQueueFull> {
+        self.status_q.push(msg)
+    }
+
+    /// Return `true` if no status messages are pending.
+    pub fn status_drained(&self) -> bool {
+        self.status_q.is_empty()
+    }
+
+    /// Submit a data-IN transfer (device → host) on the shared bulk-IN endpoint.
+    ///
+    /// Returns `WouldBlock` when the driver queue is full.
+    pub fn submit_data_in<B: TransferBus>(&self, bus: &B, buf: &[u8]) -> Result<(), UsbError> {
+        bus.submit_write(self.data_in, buf)
+    }
+
+    /// Poll for completion of the oldest pending data-IN transfer.
+    ///
+    /// Returns `Some(Ok(n))` on completion, `Some(Err(_))` on error, `None`
+    /// while still in flight.
+    pub fn poll_data_in<B: TransferBus>(&self, bus: &B) -> Option<Result<usize, UsbError>> {
+        bus.poll_transfer(self.data_in)
+    }
+
+    /// Prime a data-OUT transfer (host → device) on the shared bulk-OUT endpoint.
+    ///
+    /// Returns `WouldBlock` when the driver queue is full.
+    pub fn submit_data_out<B: TransferBus>(&self, bus: &B, buf: &mut [u8]) -> Result<(), UsbError> {
+        bus.submit_read(self.data_out, buf)
+    }
+
+    /// Poll for completion of the oldest pending data-OUT transfer.
+    ///
+    /// Returns `Some(Ok(n))` on completion, `Some(Err(_))` on error, `None`
+    /// while still in flight.
+    pub fn poll_data_out<B: TransferBus>(&self, bus: &B) -> Option<Result<usize, UsbError>> {
+        bus.poll_transfer(self.data_out)
+    }
+
+    /// Reset the engine: clear the tag table, flush the status queue.
+    ///
+    /// Called on USB reset or SET_INTERFACE to a new alternate setting.
+    pub fn reset(&mut self) {
+        self.table.clear();
+        self.status_q.clear();
+    }
+
+    /// Write the alt-1 UAS endpoint descriptors to `writer` in f_tcm HS order.
+    ///
+    /// The data endpoints (`data_in_ep`, `data_out_ep`) are the shared BOT
+    /// endpoints passed in from the caller; the status and command endpoints
+    /// are owned by `self`.
+    ///
+    /// Order (§6.3 of the protocol reference):
+    /// data-in + PU3, data-out + PU4, status + PU2, cmd + PU1.
+    ///
+    /// Each endpoint descriptor is immediately followed by its 4-byte Pipe
+    /// Usage descriptor (`[0x04, 0x24, bPipeID, 0x00]`).
+    pub(crate) fn write_alt1_descriptors(
+        &self,
+        writer: &mut usb_device::descriptor::DescriptorWriter,
+        data_in_ep: &Endpoint<'alloc, Bus, In>,
+        data_out_ep: &Endpoint<'alloc, Bus, Out>,
+    ) -> usb_device::Result<()> {
+        // data-in (shared BOT bulk IN): Pipe ID 3
+        writer.endpoint(data_in_ep)?;
+        writer.write(0x24, &[0x03, 0x00])?;
+
+        // data-out (shared BOT bulk OUT): Pipe ID 4
+        writer.endpoint(data_out_ep)?;
+        writer.write(0x24, &[0x04, 0x00])?;
+
+        // status (UAS-exclusive bulk IN): Pipe ID 2
+        writer.endpoint(&self.status_ep)?;
+        writer.write(0x24, &[0x02, 0x00])?;
+
+        // command (UAS-exclusive bulk OUT): Pipe ID 1
+        writer.endpoint(&self.cmd_ep)?;
+        writer.write(0x24, &[0x01, 0x00])?;
+
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -673,6 +1159,58 @@ mod tests {
                     }
                     other => panic!("unexpected ScsiCommand: {:?}", other),
                 }
+            }
+            IuParse::TaskMgmt(_) => panic!("expected Command, got TaskMgmt"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_command_iu_lun1_reads_byte_9() -> TestResult {
+        // Given: a Command IU addressing LUN 1 the way Linux int_to_scsilun()
+        // encodes it — SAM peripheral addressing, byte 8 = 0x00 (method/bus),
+        // byte 9 = 0x01 (the LUN). HW-observed encoding 2026-06-11.
+        let mut raw = [0u8; 32];
+        raw[0] = IU_ID_COMMAND;
+        raw[3] = 0x01; // tag = 1
+        raw[8] = 0x00; // address method / bus
+        raw[9] = 0x01; // LUN 1
+        raw[16] = 0x12; // INQUIRY
+
+        // When
+        let parsed = parse_iu(&raw).map_err(|_| "parse failed")?;
+
+        // Then: lun must come from byte 9, not byte 8
+        match parsed {
+            IuParse::Command(iu) => {
+                assert_eq!(iu.lun, 1, "LUN 1 must be read from IU byte 9");
+            }
+            IuParse::TaskMgmt(_) => panic!("expected Command, got TaskMgmt"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_command_iu_exotic_lun_encoding_rejected() -> TestResult {
+        // Given: a LUN field that is not a clean single-level encoding
+        // (non-zero address-method byte 8)
+        let mut raw = [0u8; 32];
+        raw[0] = IU_ID_COMMAND;
+        raw[3] = 0x02; // tag = 2
+        raw[8] = 0x40; // non-peripheral addressing method
+        raw[16] = 0x12;
+
+        // When
+        let parsed = parse_iu(&raw).map_err(|_| "parse failed")?;
+
+        // Then: collapses to the non-zero sentinel so callers reject it
+        match parsed {
+            IuParse::Command(iu) => {
+                assert_eq!(
+                    iu.lun,
+                    u8::MAX,
+                    "exotic LUN encodings must collapse to u8::MAX"
+                );
             }
             IuParse::TaskMgmt(_) => panic!("expected Command, got TaskMgmt"),
         }
@@ -960,5 +1498,96 @@ mod tests {
             let recovered = u16::from_be_bytes([iu[2], iu[3]]);
             prop_assert_eq!(recovered, tag, "tag should roundtrip through build_ready_iu");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // StatusQueue tests (feature = "transfer" / "uas")
+    // -----------------------------------------------------------------------
+
+    /// Push N messages into the queue and verify they drain in FIFO order.
+    #[cfg(feature = "transfer")]
+    #[test]
+    fn test_status_queue_fifo_order_and_capacity() -> TestResult {
+        use super::{StatusMsg, StatusQueue};
+
+        // Given: an empty StatusQueue
+        let mut q = StatusQueue::new();
+        assert!(q.is_empty(), "queue should start empty");
+
+        // When: push ReadReady(1), WriteReady(2), Good(3), Response(4, 0x09)
+        q.push(StatusMsg::ReadReady { tag: 1 }).expect("push 1");
+        q.push(StatusMsg::WriteReady { tag: 2 }).expect("push 2");
+        q.push(StatusMsg::Good { tag: 3 }).expect("push 3");
+        q.push(StatusMsg::Response {
+            tag: 4,
+            code: RC_INCORRECT_LUN,
+        })
+        .expect("push 4");
+
+        // Then: peek sees ReadReady(1) without removing it
+        assert!(
+            matches!(q.peek(), Some(StatusMsg::ReadReady { tag: 1 })),
+            "peek should show ReadReady(1)"
+        );
+
+        // When: pop all 4 entries
+        let m1 = q.pop().expect("pop 1");
+        let m2 = q.pop().expect("pop 2");
+        let m3 = q.pop().expect("pop 3");
+        let m4 = q.pop().expect("pop 4");
+
+        // Then: FIFO order is preserved
+        assert!(
+            matches!(m1, StatusMsg::ReadReady { tag: 1 }),
+            "first pop should be ReadReady(1), got unexpected variant"
+        );
+        assert!(
+            matches!(m2, StatusMsg::WriteReady { tag: 2 }),
+            "second pop should be WriteReady(2)"
+        );
+        assert!(
+            matches!(m3, StatusMsg::Good { tag: 3 }),
+            "third pop should be Good(3)"
+        );
+        assert!(
+            matches!(m4, StatusMsg::Response { tag: 4, code: 0x09 }),
+            "fourth pop should be Response(4, RC_INCORRECT_LUN)"
+        );
+
+        // Then: queue is empty after draining
+        assert!(
+            q.is_empty(),
+            "queue should be empty after draining all entries"
+        );
+        assert!(q.pop().is_none(), "pop on empty queue should return None");
+        Ok(())
+    }
+
+    /// Filling to STATUS_QUEUE_CAP and then pushing one more returns Full.
+    #[cfg(feature = "transfer")]
+    #[test]
+    fn test_status_queue_push_at_capacity_returns_full() -> TestResult {
+        use super::{STATUS_QUEUE_CAP, StatusMsg, StatusQueue, StatusQueueFull};
+
+        // Given: a StatusQueue filled to STATUS_QUEUE_CAP
+        let mut q = StatusQueue::new();
+        for i in 0..STATUS_QUEUE_CAP {
+            // Use tag values 1..=STATUS_QUEUE_CAP (u16-safe since cap = 36)
+            let tag = u16::try_from(i + 1).unwrap_or(u16::MAX);
+            q.push(StatusMsg::Good { tag })
+                .expect("push within capacity should succeed");
+        }
+
+        // When: one more push is attempted
+        let result = q.push(StatusMsg::Good { tag: 0xFFFF });
+
+        // Then: it returns StatusQueueFull (a unit struct — just check it's Err)
+        assert!(
+            result.is_err(),
+            "push into a full queue should return StatusQueueFull"
+        );
+        // StatusQueueFull is a unit struct; we verify Err(_) is sufficient.
+        let StatusQueueFull = result.unwrap_err();
+        Ok(())
     }
 }

@@ -512,6 +512,18 @@ where
         matches!(self.state, State::DataTransferFromHost) && self.transfer_phase
     }
 
+    /// Return references to the shared data endpoints (IN and OUT).
+    ///
+    /// The UAS engine reuses these same endpoints for its data pipes so that
+    /// alt-0 (BOT) and alt-1 (UAS) share the same endpoint addresses; only the
+    /// command/status pipe endpoints are UAS-exclusive.
+    #[cfg(feature = "uas")]
+    pub(crate) fn data_endpoints(
+        &self,
+    ) -> (&Endpoint<'alloc, Bus, In>, &Endpoint<'alloc, Bus, Out>) {
+        (&self.in_ep, &self.out_ep)
+    }
+
     fn handle_read_cbw(&mut self) -> BulkOnlyTransportResult<()> {
         // CBW lazily primes one staging transfer here when the class polls while
         // Idle.  This means the CBW is effectively re-primed right after CSW
