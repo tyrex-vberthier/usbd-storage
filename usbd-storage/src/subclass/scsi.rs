@@ -2,12 +2,16 @@
 
 use crate::CLASS_MASS_STORAGE;
 use crate::transport::Transport;
+#[cfg(feature = "uas")]
+use crate::transport::uas::Uas;
 use core::fmt::Debug;
 use num_enum::TryFromPrimitive;
 use usb_device::bus::InterfaceNumber;
 use usb_device::bus::UsbBus;
 use usb_device::class::{ControlIn, ControlOut, UsbClass};
 use usb_device::descriptor::DescriptorWriter;
+#[cfg(feature = "uas")]
+use usb_device::endpoint::EndpointAddress;
 #[cfg(feature = "bbb")]
 use {
     crate::fmt::debug,
@@ -433,6 +437,233 @@ where
 
     fn control_out(&mut self, xfer: ControlOut<Bus>) {
         self.transport.control_out(xfer)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ScsiUas — SCSI over UAS (alt-setting 1) with BOT fall-back (alt-setting 0)
+// ---------------------------------------------------------------------------
+
+/// SCSI Mass Storage class that exposes both BOT (alt 0) and UAS (alt 1).
+///
+/// Internally the BOT transport (`inner`) owns the two shared data endpoints
+/// (bulk IN / bulk OUT); the UAS engine (`uas`) owns two additional bulk
+/// endpoints (command OUT / status IN) and stores the shared endpoint addresses
+/// so data-phase transfers can be driven on them.
+///
+/// # Alternate setting behaviour
+///
+/// * **Alt 0 (BOT)** — `poll_transfer` is forwarded to the inner `Scsi`; the
+///   UAS engine is idle.
+/// * **Alt 1 (UAS)** — `poll_transfer` is a no-op; the caller drives the UAS
+///   engine via `uas()` directly.
+///
+/// SET_INTERFACE switches between the two settings; both the BOT state machine
+/// and the UAS engine are reset on every switch.
+#[cfg(feature = "uas")]
+pub struct ScsiUas<'alloc, Bus: UsbBus, Buf: BorrowMut<[u8]>> {
+    /// BOT-based SCSI class (owns the shared data endpoints).
+    inner: Scsi<BulkOnly<'alloc, Bus, Buf>>,
+    /// UAS engine (owns command/status endpoints; references shared data EPs).
+    uas: Uas<'alloc, Bus>,
+    /// Currently active alternate setting: 0 = BOT, 1 = UAS.
+    active_alt: u8,
+}
+
+#[cfg(feature = "uas")]
+impl<'alloc, Bus, Buf> ScsiUas<'alloc, Bus, Buf>
+where
+    Bus: UsbBus + 'alloc,
+    Buf: BorrowMut<[u8]>,
+{
+    /// Construct a `ScsiUas` instance.
+    ///
+    /// The BOT transport is allocated first (so the shared data endpoints get
+    /// their deterministic addresses), then the UAS engine is allocated with
+    /// those addresses.
+    ///
+    /// # Arguments
+    ///
+    /// * `alloc` — USB bus allocator.
+    /// * `packet_size` — Maximum USB packet size (512 for High Speed).
+    /// * `max_lun` — Maximum LUN index (0 for single-LUN devices).
+    /// * `buf` — IO buffer for the BOT transport; must fit at least one CBW
+    ///   and one full packet.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`BulkOnlyError`] if the BOT transport cannot be constructed
+    /// (invalid `max_lun` or buffer too small).
+    ///
+    /// # Panics
+    ///
+    /// Panics if endpoint allocation fails (same contract as
+    /// [`Scsi::new`]).
+    pub fn new(
+        alloc: &'alloc UsbBusAllocator<Bus>,
+        packet_size: u16,
+        max_lun: u8,
+        buf: Buf,
+    ) -> Result<Self, BulkOnlyError> {
+        let inner = Scsi::new(alloc, packet_size, max_lun, buf)?;
+        // Retrieve the shared data endpoint addresses from the BOT transport
+        // before handing control to the UAS engine.
+        let (data_in_ep, data_out_ep) = inner.transport.data_endpoints();
+        let data_in = data_in_ep.address();
+        let data_out = data_out_ep.address();
+        let uas = Uas::new(alloc, packet_size, data_in, data_out);
+        Ok(Self {
+            inner,
+            uas,
+            active_alt: 0,
+        })
+    }
+
+    /// Drive the BOT data path (active only in alt 0).
+    ///
+    /// When alt 1 (UAS) is active this is a no-op; the caller drives the UAS
+    /// engine directly via [`Self::uas`].
+    ///
+    /// See [`Scsi::poll_transfer`] for the callback contract.
+    pub fn poll_transfer<B, F>(&mut self, bus: &B, callback: F) -> Result<(), UsbError>
+    where
+        B: crate::transfer::TransferBus,
+        F: FnMut(Command<ScsiCommand, Scsi<BulkOnly<'alloc, Bus, Buf>>>, &B),
+    {
+        if self.active_alt == 0 {
+            self.inner.poll_transfer(bus, callback)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Return the currently active alternate setting (0 = BOT, 1 = UAS).
+    pub fn active_alt(&self) -> u8 {
+        self.active_alt
+    }
+
+    /// Return a mutable reference to the UAS engine.
+    ///
+    /// Use this to call [`Uas::pump`], [`Uas::enqueue_status`], and the data
+    /// pipe helpers when alt 1 is active.
+    pub fn uas(&mut self) -> &mut Uas<'alloc, Bus> {
+        &mut self.uas
+    }
+
+    /// Addresses of the shared data pipes as `(bulk IN, bulk OUT)`.
+    ///
+    /// These endpoints are listed in BOTH alternate settings; on a
+    /// SET_INTERFACE switch the firmware must cancel any transfers the
+    /// previous alt left queued on them (a stale BOT CBW prime on the bulk
+    /// OUT otherwise swallows the first packet of the first UAS data-out
+    /// phase — HW-observed 2026-06-11).
+    pub fn data_pipe_addresses(&self) -> (EndpointAddress, EndpointAddress) {
+        let (data_in, data_out) = self.inner.transport.data_endpoints();
+        (data_in.address(), data_out.address())
+    }
+}
+
+/// `UsbClass` implementation for [`ScsiUas`].
+///
+/// Descriptors mirror `Scsi<BulkOnly>`'s alt-0 output byte-for-byte, then
+/// append the alt-1 UAS descriptor set in f_tcm HS order
+/// (data-in + PU3, data-out + PU4, status + PU2, cmd + PU1).
+///
+/// Control requests and endpoint callbacks are forwarded to the inner BOT
+/// class so GET_MAX_LUN and BOT Mass Storage Reset keep working under alt 0.
+///
+/// GET_INTERFACE / SET_INTERFACE are handled here:
+/// * `get_alt_setting` returns `Some(active_alt)` for the MSC interface.
+/// * `set_alt_setting` accepts 0 and 1; on accept it resets both the BOT state
+///   machine and the UAS engine and returns `true`.
+#[cfg(feature = "uas")]
+impl<'alloc, Bus, Buf> UsbClass<Bus> for ScsiUas<'alloc, Bus, Buf>
+where
+    Bus: UsbBus + 'alloc,
+    Buf: BorrowMut<[u8]>,
+{
+    fn get_configuration_descriptors(
+        &self,
+        writer: &mut DescriptorWriter,
+    ) -> usb_device::Result<()> {
+        use crate::transport::bbb::TRANSPORT_BBB;
+        use crate::transport::uas::TRANSPORT_UAS;
+
+        // --- Alt 0: BOT (byte-identical to Scsi<BulkOnly>'s output) ----------
+        //
+        // Scsi<T>::UsbClass writes: IAD, interface(alt 0), endpoint descriptors.
+        // We reproduce this exactly so the alt-0 wire encoding is unchanged.
+        writer.iad(
+            self.inner.interface,
+            1,
+            CLASS_MASS_STORAGE,
+            SUBCLASS_SCSI,
+            TRANSPORT_BBB,
+            None,
+        )?;
+        writer.interface(
+            self.inner.interface,
+            CLASS_MASS_STORAGE,
+            SUBCLASS_SCSI,
+            TRANSPORT_BBB,
+        )?;
+        // BOT endpoints: in_ep (bulk IN), out_ep (bulk OUT).
+        self.inner.transport.get_endpoint_descriptors(writer)?;
+
+        // --- Alt 1: UAS, f_tcm HS order: data-in, data-out, status, cmd ------
+        //
+        // Each endpoint is immediately followed by its 4-byte Pipe Usage
+        // descriptor (type 0x24).  The actual writes are delegated to
+        // `Uas::write_alt1_descriptors` which has access to the private
+        // status/command endpoint fields.
+        writer.interface_alt(
+            self.inner.interface,
+            1,
+            CLASS_MASS_STORAGE,
+            SUBCLASS_SCSI,
+            TRANSPORT_UAS,
+            None,
+        )?;
+
+        let (data_in_ep, data_out_ep) = self.inner.transport.data_endpoints();
+        self.uas
+            .write_alt1_descriptors(writer, data_in_ep, data_out_ep)?;
+
+        Ok(())
+    }
+
+    fn reset(&mut self) {
+        self.inner.transport.reset();
+        self.uas.reset();
+        self.active_alt = 0;
+    }
+
+    fn control_in(&mut self, xfer: ControlIn<Bus>) {
+        // Forward BOT class requests (GET_MAX_LUN, BOT reset) to the inner
+        // transport so they keep working while alt 0 is active.
+        self.inner.transport.control_in(xfer);
+    }
+
+    fn get_alt_setting(&mut self, interface: InterfaceNumber) -> Option<u8> {
+        if interface == self.inner.interface {
+            Some(self.active_alt)
+        } else {
+            None
+        }
+    }
+
+    fn set_alt_setting(&mut self, interface: InterfaceNumber, alternative: u8) -> bool {
+        if interface != self.inner.interface {
+            return false;
+        }
+        if alternative > 1 {
+            return false;
+        }
+        // Accept: reset both transports and record the new setting.
+        self.inner.transport.reset();
+        self.uas.reset();
+        self.active_alt = alternative;
+        true
     }
 }
 
