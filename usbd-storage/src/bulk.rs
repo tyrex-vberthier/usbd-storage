@@ -11,8 +11,8 @@
 //! infrastructure) depends only on the trait itself and compiles without the
 //! feature.
 
-use usb_device::endpoint::EndpointAddress;
 use usb_device::UsbError;
+use usb_device::endpoint::EndpointAddress;
 
 /// A USB bus that can prime a single large bulk transfer.
 ///
