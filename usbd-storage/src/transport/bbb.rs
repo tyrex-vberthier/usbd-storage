@@ -1,7 +1,7 @@
 //! Bulk Only Transport (BBB/BOT)
 
 use crate::buffer::Buffer;
-use crate::fmt::{info, trace};
+use crate::fmt::{info, trace, warning};
 #[cfg(feature = "transfer")]
 use crate::transfer::TransferBus;
 use crate::transport::{CommandStatus, Transport, TransportError};
@@ -235,15 +235,16 @@ where
         if !matches!(self.state, State::DataTransferFromHost) {
             return Err(TransportError::Error(BulkOnlyError::InvalidState));
         }
+        // The closure always returns Ok, so the outer Result is always Ok too.
         Ok(self
             .buf
             .read(|buf| {
                 // fill 'dst' or however much is in 'buf'
                 let size = min(dst.len(), buf.len());
                 dst[..size].copy_from_slice(&buf[..size]);
-                Ok::<usize, ()>(size)
+                Ok::<usize, core::convert::Infallible>(size)
             })
-            .unwrap())
+            .unwrap_or(0))
     }
 
     /// Writes data from the IO buffer returning the number of bytes actually written
@@ -613,8 +614,19 @@ where
         if self.cbw.data_transfer_len > 0 {
             match self.state {
                 State::DataTransferToHost => {
-                    //TODO: send zlp right here
-                    self.stall_in_ep();
+                    // BOT 6.7.2 case 5 (Hi > Di): the host's allocation length is an
+                    // upper bound, so a command that *passed* while sending less data
+                    // than requested (e.g. MODE SENSE answering a 192-byte allocation
+                    // with a 4-byte header) is a valid short transfer — the host
+                    // accepts it and reads the CSW, which carries the residue.
+                    // Halting the IN pipe here instead forces every such command
+                    // through stall recovery; on Linux this can degenerate into a
+                    // device reset on each MODE SENSE probe. Only halt when the
+                    // command did not pass (a genuine early termination, spec cases
+                    // 7/8/12/13).
+                    if !matches!(self.cs, Some(CommandStatus::Passed)) {
+                        self.stall_in_ep();
+                    }
                 }
                 State::DataTransferFromHost => {
                     self.stall_out_ep();
@@ -634,7 +646,11 @@ where
         // CSW serialization is structural when using TransferBus: the driver's
         // depth-1 IN queue makes later IN submits return WouldBlock until the
         // CSW retires, so the next command cannot be primed ahead of this CSW.
-        let csw = self.build_csw().unwrap();
+        // cs must be Some here (enforced by check_end_data_transfer); report a
+        // transport error on a state-machine bug instead of panicking the device.
+        let csw = self
+            .build_csw()
+            .ok_or(TransportError::Error(BulkOnlyError::InvalidState))?;
         self.buf.clean();
         self.buf.write(csw.as_slice());
 
@@ -665,12 +681,13 @@ where
 
         // read CBW from buf
         let mut raw_cbw = [0u8; CBW_LEN];
+        // The closure always returns Ok; unwrap_or(0) is unreachable but avoids unwrap().
         self.buf
-            .read::<()>(|buf| {
+            .read::<core::convert::Infallible>(|buf| {
                 raw_cbw.copy_from_slice(&buf[..CBW_LEN]); // buf.len() checked in the beginning
                 Ok(CBW_LEN)
             })
-            .unwrap();
+            .unwrap_or(0);
 
         // check if CBW is valid. Spec. 6.2.1
         if !raw_cbw.starts_with(&CBW_SIGNATURE_LE) {
@@ -828,9 +845,12 @@ where
             CLASS_SPECIFIC_BULK_ONLY_MASS_STORAGE_RESET => {}
             // Spec. section 3.2
             CLASS_SPECIFIC_GET_MAX_LUN => {
-                // always respond with LUN
-                xfer.accept_with(&[self.max_lun])
-                    .expect("Failed to accept Get Max Lun!");
+                // always respond with LUN. A failure here means the host
+                // misbehaved or the bus glitched mid control-transfer; log and
+                // return rather than panicking the device.
+                if let Err(err) = xfer.accept_with(&[self.max_lun]) {
+                    warning!("usb: bbb: Get Max Lun accept failed: {}", err);
+                }
             }
             _ => {}
         }
@@ -859,29 +879,39 @@ impl CommandBlockWrapper {
             return Err(InvalidCbwError);
         }
 
-        Ok(CommandBlockWrapper {
-            tag: u32::from_le_bytes(value[..4].try_into().unwrap()),
-            data_transfer_len: u32::from_le_bytes(value[4..8].try_into().unwrap()),
-            direction: if u32::from_le_bytes(value[4..8].try_into().unwrap()) != 0 {
-                if (value[8] & (1 << 7)) > 0 {
-                    DataDirection::In
-                } else {
-                    DataDirection::Out
-                }
+        // These slices are always exactly 4 / 4 / 16 bytes given the CBW layout;
+        // map the (unreachable) TryInto failure to InvalidCbwError rather than
+        // unwrapping.
+        let tag = u32::from_le_bytes(value[..4].try_into().map_err(|_| InvalidCbwError)?);
+        let data_transfer_len =
+            u32::from_le_bytes(value[4..8].try_into().map_err(|_| InvalidCbwError)?);
+        let direction = if data_transfer_len != 0 {
+            if (value[8] & (1 << 7)) > 0 {
+                DataDirection::In
             } else {
-                DataDirection::NotExpected
-            },
+                DataDirection::Out
+            }
+        } else {
+            DataDirection::NotExpected
+        };
+        let block: [u8; 16] = value[11..].try_into().map_err(|_| InvalidCbwError)?;
+
+        Ok(CommandBlockWrapper {
+            tag,
+            data_transfer_len,
+            direction,
             lun: value[9] & 0b00001111,
             block_len: block_len as usize,
-            block: value[11..].try_into().unwrap(), // ok, because we checked a length
+            block,
         })
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::transport::CommandStatus;
     use crate::transport::bbb::BulkOnly;
-    use crate::transport::bbb::State::DataTransferFromHost;
+    use crate::transport::bbb::State::{DataTransferFromHost, DataTransferToHost};
     use usb_device::bus::{PollResult, UsbBus, UsbBusAllocator};
     use usb_device::class_prelude::{EndpointAddress, EndpointType};
     use usb_device::{UsbDirection, UsbError};
@@ -935,6 +965,139 @@ mod tests {
         bbb.buf.write([0xFFu8; BUF_SIZE].as_slice()); // fill the buffer
 
         assert_eq!(N, bbb.read_data([0u8; N].as_mut_slice()).unwrap());
+    }
+
+    /// Shared observation state for [`StallRecordBus`]: records endpoint halts
+    /// and counts IN-endpoint writes, behind an `Arc` so the test can observe
+    /// them after the `UsbBusAllocator` is frozen.
+    struct StallInner {
+        in_stalled: core::sync::atomic::AtomicBool,
+        out_stalled: core::sync::atomic::AtomicBool,
+        in_writes: core::sync::atomic::AtomicUsize,
+    }
+
+    /// A bus that records `set_stalled` calls per direction, for testing
+    /// `end_data_transfer`'s BOT 6.7.2 halt decisions. Unlike [`DummyBus`] it
+    /// honors the endpoint direction in `alloc_ep`, so bulk-IN and bulk-OUT
+    /// halts are distinguishable.
+    struct StallRecordBus(std::sync::Arc<StallInner>);
+
+    impl UsbBus for StallRecordBus {
+        fn alloc_ep(
+            &mut self,
+            ep_dir: UsbDirection,
+            _ep_addr: Option<EndpointAddress>,
+            _ep_type: EndpointType,
+            _max_packet_size: u16,
+            _interval: u8,
+        ) -> usb_device::Result<EndpointAddress> {
+            Ok(EndpointAddress::from_parts(1, ep_dir))
+        }
+        fn enable(&mut self) {}
+        fn reset(&self) {}
+        fn set_device_address(&self, _addr: u8) {}
+        fn write(&self, ep_addr: EndpointAddress, buf: &[u8]) -> usb_device::Result<usize> {
+            if ep_addr.direction() == UsbDirection::In {
+                self.0
+                    .in_writes
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
+            Ok(buf.len())
+        }
+        fn read(&self, _ep_addr: EndpointAddress, _buf: &mut [u8]) -> usb_device::Result<usize> {
+            Err(UsbError::WouldBlock)
+        }
+        fn set_stalled(&self, ep_addr: EndpointAddress, stalled: bool) {
+            let flag = match ep_addr.direction() {
+                UsbDirection::In => &self.0.in_stalled,
+                UsbDirection::Out => &self.0.out_stalled,
+            };
+            flag.store(stalled, core::sync::atomic::Ordering::Relaxed);
+        }
+        fn is_stalled(&self, ep_addr: EndpointAddress) -> bool {
+            let flag = match ep_addr.direction() {
+                UsbDirection::In => &self.0.in_stalled,
+                UsbDirection::Out => &self.0.out_stalled,
+            };
+            flag.load(core::sync::atomic::Ordering::Relaxed)
+        }
+        fn suspend(&self) {}
+        fn resume(&self) {}
+        fn poll(&self) -> PollResult {
+            PollResult::None
+        }
+    }
+
+    /// Build a `BulkOnly` over a [`StallRecordBus`] at the end of an IN data
+    /// phase (`DataTransferToHost`, IO buffer drained) with `residue` bytes the
+    /// host asked for but the command did not send, set `status`, and run
+    /// `check_end_data_transfer`. Returns the bus state for assertions.
+    fn end_in_transfer_with_status(
+        residue: u32,
+        status: CommandStatus,
+    ) -> std::sync::Arc<StallInner> {
+        use usb_device::device::{UsbDeviceBuilder, UsbVidPid};
+
+        let inner = std::sync::Arc::new(StallInner {
+            in_stalled: core::sync::atomic::AtomicBool::new(false),
+            out_stalled: core::sync::atomic::AtomicBool::new(false),
+            in_writes: core::sync::atomic::AtomicUsize::new(0),
+        });
+        let alloc = UsbBusAllocator::new(StallRecordBus(std::sync::Arc::clone(&inner)));
+        let mut bbb = BulkOnly::new(&alloc, 64, 0, vec![0u8; 512]).unwrap();
+        // Trigger UsbBusAllocator::freeze() so the endpoints' bus pointer is live.
+        let _usb_dev = UsbDeviceBuilder::new(&alloc, UsbVidPid(0x0000, 0x0000)).build();
+
+        // End of an IN data phase: buffer drained, residue outstanding, status
+        // set — mimics a handler that responded with less than the allocation
+        // length (e.g. MODE SENSE sending a 4-byte header for a 192-byte
+        // allocation).
+        bbb.state = DataTransferToHost;
+        bbb.cbw.data_transfer_len = residue;
+        bbb.cs = Some(status);
+
+        bbb.check_end_data_transfer().unwrap();
+        assert!(
+            !matches!(bbb.state, DataTransferToHost),
+            "data phase must end once status is set and the buffer is drained"
+        );
+        inner
+    }
+
+    /// BOT 6.7.2 case 5 (Hi > Di) with a **passed** command: a deliberately
+    /// short — but valid — IN response must not halt the bulk-IN endpoint; the
+    /// device just sends the CSW carrying the residue.
+    #[test]
+    fn passed_short_read_does_not_stall_bulk_in() {
+        let inner = end_in_transfer_with_status(188, CommandStatus::Passed);
+
+        assert!(
+            !inner.in_stalled.load(core::sync::atomic::Ordering::Relaxed),
+            "a passed short read must not halt the bulk-IN endpoint"
+        );
+        assert!(
+            !inner
+                .out_stalled
+                .load(core::sync::atomic::Ordering::Relaxed),
+            "an IN data phase must never halt the bulk-OUT endpoint"
+        );
+        assert!(
+            inner.in_writes.load(core::sync::atomic::Ordering::Relaxed) >= 1,
+            "the CSW must still be sent on the bulk-IN endpoint"
+        );
+    }
+
+    /// Counterpart: a command that did NOT pass (a genuine early termination,
+    /// spec cases 7/8/12/13) must still halt the bulk-IN endpoint before the
+    /// CSW, so the passed-short-read carve-out cannot over-reach.
+    #[test]
+    fn failed_short_read_stalls_bulk_in() {
+        let inner = end_in_transfer_with_status(188, CommandStatus::Failed);
+
+        assert!(
+            inner.in_stalled.load(core::sync::atomic::Ordering::Relaxed),
+            "a failed transfer with residue must halt the bulk-IN endpoint"
+        );
     }
 
     /// A [`DummyBus`]-alike whose `TransferBus` submit methods always return
