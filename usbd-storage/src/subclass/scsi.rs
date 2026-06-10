@@ -248,21 +248,65 @@ impl<'alloc, Bus: UsbBus + 'alloc, Buf: BorrowMut<[u8]>> Scsi<BulkOnly<'alloc, B
     ///
     /// # Arguments
     /// * `callback` - closure, in which the SCSI command is processed
-    pub fn poll<F>(&mut self, mut callback: F) -> Result<(), UsbError>
+    pub fn poll<F>(&mut self, callback: F) -> Result<(), UsbError>
     where
         F: FnMut(Command<ScsiCommand, Scsi<BulkOnly<'alloc, Bus, Buf>>>),
     {
-        fn map_ignore<T>(res: Result<T, TransportError<BulkOnlyError>>) -> Result<(), UsbError> {
-            match res {
-                Ok(_)
-                | Err(TransportError::Usb(UsbError::WouldBlock))
-                | Err(TransportError::Error(_)) => Ok(()),
-                Err(TransportError::Usb(err)) => Err(err),
-            }
+        self.poll_inner(
+            // pre-read: drive the per-packet OUT path unconditionally.
+            |t| t.read(),
+            // write step: the ordinary transport write.
+            |t| t.write(),
+            // post-read: drive the per-packet OUT path unconditionally.
+            |t| t.read(),
+            // command callback.
+            callback,
+        )
+    }
+}
+
+/// Shared, panic-free `Result`-collapse used by `poll_inner`.
+///
+/// `WouldBlock` and any transport-level `Error(_)` are non-fatal (the next
+/// poll retries); only a genuine non-`WouldBlock` USB error is propagated.
+#[cfg(feature = "bbb")]
+fn map_ignore<T>(res: Result<T, TransportError<BulkOnlyError>>) -> Result<(), UsbError> {
+    match res {
+        Ok(_) | Err(TransportError::Usb(UsbError::WouldBlock)) | Err(TransportError::Error(_)) => {
+            Ok(())
         }
+        Err(TransportError::Usb(err)) => Err(err),
+    }
+}
+
+#[cfg(feature = "bbb")]
+impl<'alloc, Bus: UsbBus + 'alloc, Buf: BorrowMut<[u8]>> Scsi<BulkOnly<'alloc, Bus, Buf>> {
+    /// Common poll skeleton. The three transport steps and the user callback are
+    /// supplied as closures so callers can vary them without duplicating the
+    /// dispatch logic:
+    ///
+    /// * `pre_read`  — drive the inbound (OUT) path before the user action.
+    /// * `write`     — drive the outbound (IN/CSW) path.
+    /// * `post_read` — drive the inbound path after the user action.
+    #[inline]
+    fn poll_inner<PreRead, Write, PostRead, Cb>(
+        &mut self,
+        mut pre_read: PreRead,
+        mut write: Write,
+        mut post_read: PostRead,
+        mut callback: Cb,
+    ) -> Result<(), UsbError>
+    where
+        PreRead:
+            FnMut(&mut BulkOnly<'alloc, Bus, Buf>) -> Result<(), TransportError<BulkOnlyError>>,
+        Write: FnMut(&mut BulkOnly<'alloc, Bus, Buf>) -> Result<(), TransportError<BulkOnlyError>>,
+        PostRead:
+            FnMut(&mut BulkOnly<'alloc, Bus, Buf>) -> Result<(), TransportError<BulkOnlyError>>,
+        Cb: FnMut(Command<ScsiCommand, Scsi<BulkOnly<'alloc, Bus, Buf>>>),
+    {
         // drive transport in both directions before user action
-        map_ignore(self.transport.read())?;
-        map_ignore(self.transport.write())?;
+        map_ignore(pre_read(&mut self.transport))?;
+        map_ignore(write(&mut self.transport))?;
 
         if let Some(raw_cb) = self.transport.get_command() {
             // exec callback only if user action required
@@ -281,7 +325,7 @@ impl<'alloc, Bus: UsbBus + 'alloc, Buf: BorrowMut<[u8]>> Scsi<BulkOnly<'alloc, B
 
                     // drive transport in both directions after user action.
                     // exec callback if not enough data
-                    match self.transport.write() {
+                    match write(&mut self.transport) {
                         Err(TransportError::Error(BulkOnlyError::FullPacketExpected)) => {
                             continue;
                         }
@@ -292,7 +336,7 @@ impl<'alloc, Bus: UsbBus + 'alloc, Buf: BorrowMut<[u8]>> Scsi<BulkOnly<'alloc, B
                             return Err(err);
                         }
                     };
-                    map_ignore(self.transport.read())?;
+                    map_ignore(post_read(&mut self.transport))?;
 
                     break;
                 }
