@@ -126,7 +126,7 @@ pub enum PageControl {
 }
 
 #[allow(dead_code)]
-fn parse_cb(cb: &[u8]) -> ScsiCommand {
+pub(crate) fn parse_cb(cb: &[u8]) -> ScsiCommand {
     debug_assert!(!cb.is_empty());
 
     match (cb[0], cb.len()) {
