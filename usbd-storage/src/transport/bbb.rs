@@ -1,7 +1,7 @@
 //! Bulk Only Transport (BBB/BOT)
 
 use crate::buffer::Buffer;
-use crate::fmt::{info, trace};
+use crate::fmt::{info, trace, warning};
 #[cfg(feature = "transfer")]
 use crate::transfer::TransferBus;
 use crate::transport::{CommandStatus, Transport, TransportError};
@@ -9,10 +9,10 @@ use core::borrow::BorrowMut;
 use core::cmp::min;
 use usb_device::UsbError;
 use usb_device::bus::{UsbBus, UsbBusAllocator};
-use usb_device::class::ControlIn;
+use usb_device::class::{ControlIn, ControlOut};
 use usb_device::class_prelude::DescriptorWriter;
-use usb_device::control::{Recipient, RequestType};
-use usb_device::endpoint::{Endpoint, In, Out};
+use usb_device::control::{Recipient, Request, RequestType};
+use usb_device::endpoint::{Endpoint, EndpointAddress, In, Out};
 
 /// Bulk Only Transport interface protocol
 pub(crate) const TRANSPORT_BBB: u8 = 0x50;
@@ -61,6 +61,7 @@ enum State {
     DataTransferFromHost, // reading bytes from host
     DataTransferNoData,   // data transfer not expected
     StatusTransfer,       // writing CSW packets
+    StatusTransferEpStall,
 }
 
 #[repr(u8)]
@@ -235,15 +236,16 @@ where
         if !matches!(self.state, State::DataTransferFromHost) {
             return Err(TransportError::Error(BulkOnlyError::InvalidState));
         }
+        // The closure always returns Ok, so the outer Result is always Ok too.
         Ok(self
             .buf
             .read(|buf| {
                 // fill 'dst' or however much is in 'buf'
                 let size = min(dst.len(), buf.len());
                 dst[..size].copy_from_slice(&buf[..size]);
-                Ok::<usize, ()>(size)
+                Ok::<usize, core::convert::Infallible>(size)
             })
-            .unwrap())
+            .unwrap_or(0))
     }
 
     /// Writes data from the IO buffer returning the number of bytes actually written
@@ -621,15 +623,18 @@ where
     }
 
     fn end_data_transfer(&mut self) -> BulkOnlyTransportResult<()> {
+        let mut in_ep_stall = false;
+
         // spec. 6.7.2 and 6.7.3
         if self.cbw.data_transfer_len > 0 {
             match self.state {
                 State::DataTransferToHost => {
-                    //TODO: send zlp right here
                     self.stall_in_ep();
+                    in_ep_stall = true;
                 }
                 State::DataTransferFromHost => {
                     self.stall_out_ep();
+                    in_ep_stall = true;
                 }
                 _ => {}
             }
@@ -646,12 +651,23 @@ where
         // CSW serialization is structural when using TransferBus: the driver's
         // depth-1 IN queue makes later IN submits return WouldBlock until the
         // CSW retires, so the next command cannot be primed ahead of this CSW.
-        let csw = self.build_csw().unwrap();
+        //
+        // cs must be Some here (enforced by check_end_data_transfer); report a
+        // transport error on a state-machine bug instead of panicking the device.
+        let csw = self
+            .build_csw()
+            .ok_or(TransportError::Error(BulkOnlyError::InvalidState))?;
         self.buf.clean();
         self.buf.write(csw.as_slice());
 
-        self.enter_state(State::StatusTransfer);
-        self.write() // flush
+        if !in_ep_stall {
+            self.enter_state(State::StatusTransfer);
+            self.write()?; // try writing CSW immediately
+        } else {
+            self.enter_state(State::StatusTransferEpStall);
+        }
+
+        Ok(())
     }
 
     #[inline]
@@ -677,12 +693,13 @@ where
 
         // read CBW from buf
         let mut raw_cbw = [0u8; CBW_LEN];
+        // The closure always returns Ok; unwrap_or(0) is unreachable but avoids unwrap().
         self.buf
-            .read::<()>(|buf| {
+            .read::<core::convert::Infallible>(|buf| {
                 raw_cbw.copy_from_slice(&buf[..CBW_LEN]); // buf.len() checked in the beginning
                 Ok(CBW_LEN)
             })
-            .unwrap();
+            .unwrap_or(0);
 
         // check if CBW is valid. Spec. 6.2.1
         if !raw_cbw.starts_with(&CBW_SIGNATURE_LE) {
@@ -833,18 +850,48 @@ where
             return;
         }
 
-        info!("usb: bbb: Recv ctrl_in: {}", req);
+        trace!("usb: bbb: Recv ctrl_in: {}", req);
 
         match req.request {
             // Spec. section 3.1
             CLASS_SPECIFIC_BULK_ONLY_MASS_STORAGE_RESET => {}
             // Spec. section 3.2
             CLASS_SPECIFIC_GET_MAX_LUN => {
-                // always respond with LUN
-                xfer.accept_with(&[self.max_lun])
-                    .expect("Failed to accept Get Max Lun!");
+                // always respond with LUN. A failure here means the host
+                // misbehaved or the bus glitched mid control-transfer; log and
+                // return rather than panicking the device.
+                if let Err(err) = xfer.accept_with(&[self.max_lun]) {
+                    warning!("usb: bbb: Get Max Lun accept failed: {}", err);
+                }
             }
             _ => {}
+        }
+    }
+
+    fn control_out(&mut self, xfer: ControlOut<Self::Bus>) {
+        let req = xfer.request();
+
+        if req.request_type == RequestType::Standard
+            && req.recipient == Recipient::Endpoint
+            && req.request == Request::CLEAR_FEATURE
+            && req.value == Request::FEATURE_ENDPOINT_HALT
+            && self.in_ep.address() == EndpointAddress::from(req.index as u8)
+        {
+            trace!("usb: bbb: Recv CLEAR_FEATURE(ENDPOINT_HALT) for bulk-IN ep");
+
+            // The host clears the bulk-IN halt that end_data_transfer raised on a
+            // short data phase (BOT 6.7.2/6.7.3). The deferred CSW may only go out
+            // now — sending it earlier, into the still-stalled pipe, loses it and
+            // desyncs the transport.
+            if let Err(err) = xfer.accept() {
+                warning!("usb: bbb: CLEAR_FEATURE accept failed: {}", err);
+            } else {
+                self.in_ep.unstall();
+                self.enter_state(State::StatusTransfer);
+                if let Err(err) = self.write() {
+                    warning!("usb: bbb: deferred CSW write failed: {}", err);
+                }
+            }
         }
     }
 }
@@ -871,21 +918,30 @@ impl CommandBlockWrapper {
             return Err(InvalidCbwError);
         }
 
-        Ok(CommandBlockWrapper {
-            tag: u32::from_le_bytes(value[..4].try_into().unwrap()),
-            data_transfer_len: u32::from_le_bytes(value[4..8].try_into().unwrap()),
-            direction: if u32::from_le_bytes(value[4..8].try_into().unwrap()) != 0 {
-                if (value[8] & (1 << 7)) > 0 {
-                    DataDirection::In
-                } else {
-                    DataDirection::Out
-                }
+        // These slices are always exactly 4 / 4 / 16 bytes given the CBW layout;
+        // map the (unreachable) TryInto failure to InvalidCbwError rather than
+        // unwrapping.
+        let tag = u32::from_le_bytes(value[..4].try_into().map_err(|_| InvalidCbwError)?);
+        let data_transfer_len =
+            u32::from_le_bytes(value[4..8].try_into().map_err(|_| InvalidCbwError)?);
+        let direction = if data_transfer_len != 0 {
+            if (value[8] & (1 << 7)) > 0 {
+                DataDirection::In
             } else {
-                DataDirection::NotExpected
-            },
+                DataDirection::Out
+            }
+        } else {
+            DataDirection::NotExpected
+        };
+        let block: [u8; 16] = value[11..].try_into().map_err(|_| InvalidCbwError)?;
+
+        Ok(CommandBlockWrapper {
+            tag,
+            data_transfer_len,
+            direction,
             lun: value[9] & 0b00001111,
             block_len: block_len as usize,
-            block: value[11..].try_into().unwrap(), // ok, because we checked a length
+            block,
         })
     }
 }
