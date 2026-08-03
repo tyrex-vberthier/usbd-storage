@@ -13,6 +13,42 @@ use usbd_storage::transport::bbb::BulkOnly;
 
 const TIMEOUT: Duration = Duration::from_secs(1);
 
+/// AUDIT PROBE: an invalid CBW arriving as the first command panics the subclass.
+///
+/// Spec 6.6.1 makes an invalid CBW a terminal state until Reset Recovery. But
+/// `BulkOnly::get_command()` returns `Some` for every state except `CommandTransfer`,
+/// so `poll_command` hands the callback a `CommandBlock` built from an unpopulated
+/// `CommandBlockWrapper`. On a fresh device that means `block_len == 0`, i.e. an empty
+/// CDB, and `scsi::parse_cb` indexes `cb[0]`.
+#[test]
+fn probe_b_invalid_first_cbw_panics_in_parse_cb() {
+    let mut io_buf = [0u8; 1024];
+    let dummy_bus = DummyUsbBus::new();
+    let usb_bus = UsbBusAllocator::new(dummy_bus.clone());
+    let mut scsi = Scsi::new(&usb_bus, 64, 0, io_buf.as_mut_slice()).unwrap();
+    let _ = UsbDeviceBuilder::new(&usb_bus, UsbVidPid(0xabcd, 0xabcd)).build();
+
+    // A 31-byte CBW with a corrupted dCBWSignature.
+    let mut bad = Cbw {
+        data_transfer_len: 0,
+        direction: DataDirection::NotExpected,
+        block: vec![0x12],
+    }
+    .into_bytes();
+    bad[0] ^= 0xFF;
+    dummy_bus.write_data(bad.as_slice());
+
+    scsi.poll(); // reads the CBW, enters the terminal invalid state
+
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = scsi.poll_command(|_cmd| Ok(()));
+    }));
+    assert!(
+        res.is_ok(),
+        "poll_command panicked on an invalid CBW instead of ignoring it"
+    );
+}
+
 #[test]
 fn should_fail_reading_data_from_host_with_bytes_processed() {
     run_on_scsi_bbb_bus_timed! { TIMEOUT, [

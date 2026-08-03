@@ -956,6 +956,128 @@ mod tests {
         assert_eq!(N, bbb.read_data([0u8; N].as_mut_slice()).unwrap());
     }
 
+    // ---- AUDIT PROBES (not for upstream as-is) ----
+
+    #[test]
+    fn probe_c_device_must_not_send_more_than_requested() {
+        // 6.7.2 case 7/8: "The device may send data up to a total of
+        // dCBWDataTransferLength." write_data() caps each write against
+        // left_to_transfer (the UNSENT budget) rather than the UNWRITTEN budget, so
+        // the total written can exceed dCBWDataTransferLength -- and write_packet()
+        // then writes min(packet_size, buf.len()) with no clamp to left_to_transfer.
+        const PS: u16 = 64;
+        const D: u32 = 100;
+
+        let (shared, mut bbb) = new_bbb(PS);
+        enqueue(&shared, &cbw(D, Host::ExpectsDataIn), PS);
+        let _ = bbb.poll(); // read CBW, enter DataTransferToHost
+
+        assert_eq!(100, bbb.write_data(&[0xAA; 100]).unwrap());
+        let _ = bbb.poll(); // sends a full 64-byte packet; left_to_transfer 100 -> 36
+
+        // Second write: capped to left_to_transfer (36), so total written is 136 > D.
+        assert_eq!(36, bbb.write_data(&[0xBB; 100]).unwrap());
+
+        bbb.set_status(CommandStatus::Passed, D);
+        for _ in 0..64 {
+            let _ = bbb.poll();
+            if matches!(bbb.state, State::CommandTransfer) {
+                break;
+            }
+        }
+
+        let stream = std::mem::take(&mut *shared.input.lock().unwrap()).concat();
+        let data_len = stream.len() - CSW_LEN;
+        assert_eq!(
+            data_len, D as usize,
+            "device sent {data_len} bytes for a {D}-byte request"
+        );
+    }
+
+    #[test]
+    fn probe_c2_shipped_example_overruns_on_a_short_inquiry() {
+        // The rp2040 example answers INQUIRY with try_write_data_all(&[36 bytes]).
+        // try_write_data_all applies no dCBWDataTransferLength cap at all, so when the
+        // host asks for fewer bytes than the handler writes -- ordinary host traffic,
+        // not an attack -- the device puts all 36 on the wire for a 4-byte request.
+        const PS: u16 = 64;
+        const D: u32 = 4; // host wants 4 bytes
+
+        let (shared, mut bbb) = new_bbb(PS);
+        enqueue(&shared, &cbw(D, Host::ExpectsDataIn), PS);
+        let _ = bbb.poll();
+
+        bbb.try_write_data_all(&[0xAA; 36]).unwrap(); // handler's canned INQUIRY response
+        bbb.set_status(CommandStatus::Passed, 36);
+
+        for _ in 0..64 {
+            let _ = bbb.poll();
+            if matches!(bbb.state, State::CommandTransfer) {
+                break;
+            }
+        }
+
+        let stream = std::mem::take(&mut *shared.input.lock().unwrap()).concat();
+        let data_len = stream.len() - CSW_LEN;
+        assert_eq!(
+            data_len, D as usize,
+            "device sent {data_len} bytes for a {D}-byte request"
+        );
+    }
+
+    #[test]
+    fn probe_d_out_data_unreadable_once_drained() {
+        // handle_data_transfer_from_host() moves to DataTransferToHostStatusAwait as
+        // soon as left_to_transfer == 0, but read_data() requires DataTransferFromHost.
+        // A subclass that has not drained the buffer by then loses the data.
+        const PS: u16 = 64;
+        const D: u32 = 64;
+
+        let (shared, mut bbb) = new_bbb(PS);
+        enqueue(&shared, &cbw(D, Host::ExpectsDataOut), PS);
+        enqueue(&shared, &[0xAA; D as usize], PS);
+
+        // Drive until all OUT data has been read in, then one more poll -- exactly
+        // what happens when the subclass does not consume the data on the first
+        // callback and the host keeps polling.
+        for _ in 0..16 {
+            let _ = bbb.poll();
+        }
+
+        assert_eq!(0, bbb.left_to_transfer);
+        assert_eq!(
+            D as usize,
+            bbb.buf.available_read(),
+            "the data is still sitting in the buffer"
+        );
+        let n = bbb.read_data(&mut [0u8; D as usize]).unwrap();
+        assert_eq!(n, D as usize, "buffered OUT data is unreachable");
+    }
+
+    #[test]
+    fn probe_b_invalid_cbw_presents_a_command_to_the_subclass() {
+        // 6.6.1: an invalid CBW is a terminal state until Reset Recovery. But
+        // get_command() returns Some for every state except CommandTransfer, so the
+        // subclass is handed a CommandBlock built from an unpopulated CBW. With
+        // block_len == 0 that is an empty CDB, and scsi::parse_cb indexes cb[0].
+        const PS: u16 = 64;
+
+        let (shared, mut bbb) = new_bbb(PS);
+        let mut bad = cbw(0, Host::ExpectsNoData);
+        bad[0] ^= 0xFF; // corrupt dCBWSignature
+        enqueue(&shared, &bad, PS);
+
+        let _ = bbb.poll();
+        assert_matches!(bbb.state, State::CommandTransferInvalid);
+
+        let cb = bbb.get_command();
+        assert!(
+            cb.is_none(),
+            "invalid CBW yielded a command block of {:?} bytes",
+            cb.map(|c| c.bytes.len())
+        );
+    }
+
     // ---- test harness ----
 
     const PACKET_SIZES: [u16; 4] = [8, 16, 32, 64];
