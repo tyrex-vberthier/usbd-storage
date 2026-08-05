@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `Transport::control_out`, defaulted to ignoring the request (https://github.com/apohrebniak/usbd-storage/pull/PR_D)
+
+### Fixed
+
+- BBB: honour the Bulk-Only Mass Storage Reset, which is host-to-device and so never reached `control_in` (https://github.com/apohrebniak/usbd-storage/pull/PR_D)
+
 ## [3.0.0] - 2026-07-05
 
 ### Changed
