@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- BBB: let the subclass read buffered OUT data once the host has finished sending (https://github.com/apohrebniak/usbd-storage/pull/PR_E)
+
 ## [3.0.0] - 2026-07-05
 
 ### Changed

@@ -201,18 +201,42 @@ where
         })
     }
 
+    /// Whether [read_data] may still hand the subclass buffered OUT bytes.
+    ///
+    /// `DataTransferFromHost` is the obvious case. `DataTransferToHostStatusAwait`
+    /// is the subtle one: `handle_data_transfer_from_host` enters it as soon as
+    /// `left_to_transfer` reaches zero, which happens on the poll that reads the
+    /// last packet in — before the subclass has had a chance to drain the buffer.
+    /// The state only means "all the wire traffic is done, waiting for
+    /// `set_status`", so for a host-to-device command the data is still there and
+    /// still the subclass's to read.
+    ///
+    /// Not `DataTransferFromHostEnding`: the subclass set the status early, and
+    /// that path deliberately discards what the host keeps sending.
+    ///
+    /// [read_data]: BulkOnly::read_data
+    fn can_read_data(&self) -> bool {
+        match self.state {
+            State::DataTransferFromHost => true,
+            State::DataTransferToHostStatusAwait => {
+                matches!(self.cbw.direction, DataDirection::Out)
+            }
+            _ => false,
+        }
+    }
+
     /// Reads data from the IO buffer returning the number of bytes actually read
     ///
     /// # Arguments
     /// * `dst` - buffer, to read bytes into
     ///
     /// # Errors
-    /// Returns [BulkOnlyError::InvalidState] if called
-    /// during any but OUT Data Transfer state.
+    /// Returns [BulkOnlyError::InvalidState] if called outside an OUT Data
+    /// Transfer, i.e. once the status has been set or the command is over.
     ///
     /// [BulkOnlyError::InvalidState]: crate::transport::bbb::BulkOnlyError::InvalidState
     pub fn read_data(&mut self, dst: &mut [u8]) -> BulkOnlyTransportResult<usize> {
-        if !matches!(self.state, State::DataTransferFromHost) {
+        if !self.can_read_data() {
             return Err(TransportError::Error(BulkOnlyError::InvalidState));
         }
 
@@ -954,6 +978,56 @@ mod tests {
         bbb.buf.write([0xFFu8; BUF_SIZE].as_slice()); // fill the buffer
 
         assert_eq!(N, bbb.read_data([0u8; N].as_mut_slice()).unwrap());
+    }
+
+    /// `handle_data_transfer_from_host` leaves `DataTransferFromHost` on the very
+    /// poll that reads the last packet in, so a subclass that doesn't drain the
+    /// buffer inside that one callback used to get `InvalidState` with its data
+    /// still sitting in the buffer.
+    #[test]
+    fn buffered_out_data_is_still_readable_once_the_host_has_finished_sending() {
+        const PS: u16 = 64;
+        const D: u32 = 64;
+
+        let (shared, mut bbb) = new_bbb(PS);
+        enqueue(&shared, &cbw(D, Host::ExpectsDataOut), PS);
+        enqueue(&shared, &[0xAA; D as usize], PS);
+
+        // Poll past the point where the last packet arrived, as the device does
+        // when the subclass doesn't consume the data on the first callback.
+        for _ in 0..16 {
+            let _ = bbb.poll();
+        }
+
+        assert_eq!(0, bbb.left_to_transfer);
+        assert_matches!(bbb.state, State::DataTransferToHostStatusAwait);
+
+        let mut dst = [0u8; D as usize];
+        assert_eq!(D as usize, bbb.read_data(&mut dst).unwrap());
+        assert_eq!(dst, [0xAA; D as usize]);
+    }
+
+    /// The same window on an IN command carries nothing to read: relaxing the
+    /// guard must not turn `read_data` into a no-op success there.
+    #[test]
+    fn data_in_command_still_refuses_read_data_while_awaiting_status() {
+        const PS: u16 = 64;
+
+        let (shared, mut bbb) = new_bbb(PS);
+        enqueue(&shared, &cbw(8, Host::ExpectsDataIn), PS);
+
+        for _ in 0..16 {
+            let _ = bbb.poll();
+            if matches!(bbb.state, State::DataTransferToHost) {
+                bbb.write_data(&[0xBB; 8]).unwrap();
+            }
+            if matches!(bbb.state, State::DataTransferToHostStatusAwait) {
+                break;
+            }
+        }
+
+        assert_matches!(bbb.state, State::DataTransferToHostStatusAwait);
+        assert!(is_invalid_state(bbb.read_data(&mut [0u8; 8])));
     }
 
     // ---- test harness ----
