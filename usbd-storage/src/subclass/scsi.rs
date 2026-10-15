@@ -24,6 +24,11 @@ use {
 /// SCSI device subclass code
 pub const SUBCLASS_SCSI: u8 = 0x06; // SCSI Transparent command set
 
+#[cfg(feature = "uas")]
+mod uas;
+#[cfg(feature = "uas")]
+pub use uas::ScsiUas;
+
 /* SCSI codes */
 
 /* SPC */

@@ -7,6 +7,7 @@
 //!
 //! # Transports:
 //! * [Bulk Only]
+//! * [UAS] - USB Attached SCSI, offered next to Bulk Only by [ScsiUas]
 //! * [Vendor Specific Transport]
 //!
 //! # Features
@@ -17,6 +18,7 @@
 //! | `ufi` | Include USB Floppy Interface subclass |
 //! | `defmt` | Enable logging via [defmt](https://crates.io/crates/defmt) crate |
 //! | `transfer` | Zero-copy data phases through a bus driver's transfer queue |
+//! | `uas` | Include USB Attached SCSI and [ScsiUas] (implies `bbb`, `scsi`, `transfer`) |
 //!
 //! [usb-device]: https://crates.io/crates/usb-device
 //! [Vendor Specific subclass]: crate::subclass
@@ -31,6 +33,10 @@
 #![cfg_attr(not(feature = "ufi"), doc = "[UFI]: crate::subclass")]
 #![cfg_attr(feature = "bbb", doc = "[Bulk Only]: crate::transport::bbb")]
 #![cfg_attr(not(feature = "bbb"), doc = "[Bulk Only]: crate::transport")]
+#![cfg_attr(feature = "uas", doc = "[UAS]: crate::transport::uas")]
+#![cfg_attr(not(feature = "uas"), doc = "[UAS]: crate::transport")]
+#![cfg_attr(feature = "uas", doc = "[ScsiUas]: crate::subclass::scsi::ScsiUas")]
+#![cfg_attr(not(feature = "uas"), doc = "[ScsiUas]: crate::subclass")]
 #![cfg_attr(not(test), no_std)]
 
 #[cfg(feature = "bbb")]

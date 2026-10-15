@@ -314,6 +314,14 @@ where
         self.cs.is_some()
     }
 
+    /// The bulk data endpoints, which the UAS alternate setting shares with this one.
+    #[cfg(feature = "uas")]
+    pub(crate) fn data_endpoints(
+        &self,
+    ) -> (&Endpoint<'alloc, Bus, In>, &Endpoint<'alloc, Bus, Out>) {
+        (&self.in_ep, &self.out_ep)
+    }
+
     fn enter_state_command_transfer(&mut self) {
         self.cs = None;
         self.left_to_transfer = 0;

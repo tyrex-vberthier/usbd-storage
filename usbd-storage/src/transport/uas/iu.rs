@@ -22,7 +22,7 @@ const COMMAND_IU_LEN: usize = 32;
 ///
 /// A GOOD Status IU with no sense is **exactly 16 bytes** (`f_tcm.c`,
 /// `uasp_prepare_status`).
-const STATUS_IU_HDR_LEN: usize = 16;
+pub(super) const STATUS_IU_HDR_LEN: usize = 16;
 
 /// On-wire size of a Response IU.
 const RESPONSE_IU_LEN: usize = 8;

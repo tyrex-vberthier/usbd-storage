@@ -11,7 +11,8 @@ Implemented subclasses:
 It is possible to implement a vendor-specific subclass.
 
 # Transports
-Currently, only `Bulk Only` transport is implemented. It is possible to implement a vendor-specific transport.
+`Bulk Only` and, behind the `uas` feature, `USB Attached SCSI` are implemented; the `ScsiUas` class offers the host both,
+as two alternate settings of one interface. It is possible to implement a vendor-specific transport.
 
 # Features
 This crate has a couple of opt-in features that all could be used independently.
@@ -24,6 +25,7 @@ This crate has a couple of opt-in features that all could be used independently.
 | `defmt`               | Enable logging via [defmt](https://crates.io/crates/defmt) crate |
 | `extended_addressing` | Enable commands that support 64-bit LBA and 32-bit LEN           |
 | `transfer`            | Zero-copy data phases through a bus driver's transfer queue      |
+| `uas`                 | Include USB Attached SCSI and `ScsiUas` (implies `bbb`, `scsi`, `transfer`) |
 
 # Examples
 See [examples](examples)

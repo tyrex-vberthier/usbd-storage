@@ -1,4 +1,4 @@
-//! UAS (USB Attached SCSI) IU codec and tag-table.
+//! UAS (USB Attached SCSI) transport, behind the `uas` feature.
 //!
 //! This module provides:
 //!
@@ -12,6 +12,14 @@
 //!   32-tag High Speed host queue depth (`qdepth = 32`, tags 1..=32).
 //!   `TagTable` is generic-free and `const`-constructible so it can live in
 //!   a static or embedded struct.
+//!
+//! * [`Uas`] — the engine: it reads Command and Task Management IUs from the
+//!   command pipe into the [`TagTable`], answers on the status pipe through a
+//!   queue of [`StatusMsg`], and runs data phases on the bulk data pipes it
+//!   shares with the Bulk-Only Transport, through a
+//!   [`TransferBus`](crate::transfer::TransferBus). The class that puts both
+//!   transports behind one interface is
+//!   [`ScsiUas`](crate::subclass::scsi::ScsiUas).
 //!
 //! # High Speed sequencing invariant
 //!
@@ -32,18 +40,28 @@
 //! Linux `include/linux/usb/uas.h` header (kernel commit
 //! `9716c086c8e8b141d35aa61f2e96a2e83de212a7`).
 
+mod engine;
 mod iu;
+mod status;
 mod tags;
+
+pub use engine::Uas;
 
 pub use iu::{
     CommandIu, FIXED_SENSE_LEN, IuParse, IuParseError, TaskMgmtIu, build_ready_iu,
     build_response_iu, build_status_iu, fixed_sense, parse_iu,
 };
+pub use status::{StatusMsg, StatusQueueFull};
 pub use tags::{InsertError, TagSlot, TagTable};
+
+use iu::STATUS_IU_HDR_LEN;
 
 // ---------------------------------------------------------------------------
 // Protocol constants (all from uas.h §1 / §3)
 // ---------------------------------------------------------------------------
+
+/// UAS interface protocol code (`USB_PR_UAS`), from `include/linux/usb/storage.h`.
+pub(crate) const TRANSPORT_UAS: u8 = 0x62;
 
 /// Host-side queue depth the Linux `uas` driver uses at High Speed.
 ///
