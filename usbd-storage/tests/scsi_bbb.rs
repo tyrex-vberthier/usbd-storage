@@ -296,3 +296,216 @@ fn has_command(scsi: &mut Scsi<BulkOnly<DummyUsbBus, &mut [u8]>>) -> bool {
     .unwrap();
     seen
 }
+
+#[cfg(feature = "transfer")]
+mod zero_copy {
+    use super::*;
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+    use usb_device::UsbError;
+    use usb_device::endpoint::EndpointAddress;
+    use usbd_storage::transfer::{Rejected, Retired, TransferBus};
+
+    struct Pending {
+        ep: EndpointAddress,
+        buf: &'static mut [u8],
+        len: usize,
+        out: bool,
+        done: bool,
+    }
+
+    /// A [`TransferBus`] whose transfers finish when the test says so.
+    #[derive(Default)]
+    struct MockTransfers {
+        queue: RefCell<VecDeque<Pending>>,
+    }
+
+    impl MockTransfers {
+        fn submit(
+            &self,
+            ep: EndpointAddress,
+            buf: &'static mut [u8],
+            len: usize,
+            out: bool,
+        ) -> Result<(), Rejected> {
+            self.queue.borrow_mut().push_back(Pending {
+                ep,
+                buf,
+                len,
+                out,
+                done: false,
+            });
+            Ok(())
+        }
+
+        /// Finishes the oldest transfer: an OUT one receives `data`, an IN one returns
+        /// the bytes it put on the wire.
+        fn finish(&self, data: &[u8]) -> Vec<u8> {
+            let mut queue = self.queue.borrow_mut();
+            let p = queue.front_mut().expect("no transfer queued");
+            p.done = true;
+            if p.out {
+                p.buf[..data.len()].copy_from_slice(data);
+                p.len = data.len();
+                Vec::new()
+            } else {
+                p.buf[..p.len].to_vec()
+            }
+        }
+    }
+
+    impl TransferBus for MockTransfers {
+        fn submit_write(
+            &self,
+            ep: EndpointAddress,
+            buf: &'static mut [u8],
+            len: usize,
+        ) -> Result<(), Rejected> {
+            self.submit(ep, buf, len, false)
+        }
+
+        fn submit_read(
+            &self,
+            ep: EndpointAddress,
+            buf: &'static mut [u8],
+            len: usize,
+        ) -> Result<(), Rejected> {
+            self.submit(ep, buf, len, true)
+        }
+
+        fn poll_transfer(&self, ep: EndpointAddress) -> Option<Retired> {
+            let mut queue = self.queue.borrow_mut();
+            if !queue.front().is_some_and(|p| p.done && p.ep == ep) {
+                return None;
+            }
+            let p = queue.pop_front()?;
+            Some(Retired {
+                buf: p.buf,
+                result: Ok::<usize, UsbError>(p.len),
+            })
+        }
+    }
+
+    fn dma(len: usize) -> &'static mut [u8] {
+        Box::leak(vec![0u8; len].into_boxed_slice())
+    }
+
+    /// Polls the device until it has put a CSW on the bus.
+    /// Polls the device until it stops moving bytes, then reads the CSW as the host would.
+    fn csw(scsi: &mut Scsi<BulkOnly<'_, DummyUsbBus, &mut [u8]>>, bus: &DummyUsbBus) -> Csw {
+        let mut processed = bus.bytes_processed();
+        loop {
+            scsi.poll();
+            let now = bus.bytes_processed();
+            if now == processed {
+                break;
+            }
+            processed = now;
+        }
+        bus.read_cs().expect("no CSW")
+    }
+
+    #[test]
+    fn write_and_read_without_the_io_buffer() {
+        common::timeout(TIMEOUT, || {
+            for packet_size in common::PACKET_SIZE {
+                let mut io_buf = [0u8; 1024];
+                let dummy_bus = DummyUsbBus::new();
+                let usb_bus = UsbBusAllocator::new(dummy_bus.clone());
+                let mut scsi = Scsi::new(&usb_bus, packet_size, 0, io_buf.as_mut_slice()).unwrap();
+                let _ = UsbDeviceBuilder::new(&usb_bus, UsbVidPid(0xabcd, 0xabcd)).build();
+                scsi.enable_zero_copy();
+                let transfers = MockTransfers::default();
+
+                // WRITE(10): the callback submits the whole data phase, then retires it.
+                dummy_bus.write_cbw(Cbw {
+                    data_transfer_len: 512,
+                    direction: DataDirection::Out,
+                    block: cmd_into_bytes(ScsiCommand::Write { lba: 0, len: 1 }),
+                });
+                // The host is already sending: the transport must leave these packets
+                // to the transfer the subclass is about to submit.
+                dummy_bus.write_data(&[0x5A; 512]);
+                for _ in 0..16 {
+                    scsi.poll();
+                }
+                assert_eq!(
+                    dummy_bus.out_bytes_read(),
+                    31,
+                    "ps={packet_size}: only the CBW"
+                );
+                let mut slot = Some(dma(512));
+                let mut received = None;
+                for _ in 0..256 {
+                    scsi.poll();
+                    let _ = scsi.poll_command(|mut cmd| {
+                        assert!(matches!(cmd.kind, ScsiCommand::Write { .. }));
+                        if let Some(buf) = slot.take() {
+                            cmd.submit_data_out(&transfers, buf, 512).unwrap();
+                            transfers.finish(&dummy_bus.take_out_data());
+                        } else if let Some(retired) = cmd.poll_data_transfer(&transfers)? {
+                            received = Some(retired.buf.to_vec());
+                            cmd.pass(512);
+                        }
+                        Ok(())
+                    });
+                    if received.is_some() {
+                        break;
+                    }
+                }
+                assert_eq!(received, Some(vec![0x5A; 512]), "ps={packet_size}");
+                assert_eq!(
+                    csw(&mut scsi, &dummy_bus),
+                    Csw {
+                        data_transfer_len: 0,
+                        status: CommandStatus::Passed,
+                    },
+                    "ps={packet_size}"
+                );
+
+                // READ(10): the status is set right away; the transfer is retired outside
+                // the callback, which is not called again once there is a status.
+                dummy_bus.write_cbw(Cbw {
+                    data_transfer_len: 512,
+                    direction: DataDirection::In,
+                    block: cmd_into_bytes(ScsiCommand::Read { lba: 0, len: 1 }),
+                });
+                let mut handled = false;
+                for _ in 0..256 {
+                    scsi.poll();
+                    let _ = scsi.poll_command(|mut cmd| {
+                        let buf = dma(512);
+                        buf.fill(0xA5);
+                        cmd.submit_data_in(&transfers, buf, 512).unwrap();
+                        cmd.pass(512);
+                        handled = true;
+                        Ok(())
+                    });
+                    if handled {
+                        break;
+                    }
+                }
+                assert!(handled, "ps={packet_size}");
+                scsi.poll();
+                assert!(
+                    dummy_bus.read_cs().is_none(),
+                    "ps={packet_size}: CSW before the data"
+                );
+                assert_eq!(transfers.finish(&[]), vec![0xA5; 512], "ps={packet_size}");
+                let retired = scsi
+                    .poll_data_transfer(&transfers)
+                    .unwrap()
+                    .expect("retired");
+                assert_eq!(retired.result, Ok(512), "ps={packet_size}");
+                assert_eq!(
+                    csw(&mut scsi, &dummy_bus),
+                    Csw {
+                        data_transfer_len: 0,
+                        status: CommandStatus::Passed,
+                    },
+                    "ps={packet_size}"
+                );
+            }
+        });
+    }
+}

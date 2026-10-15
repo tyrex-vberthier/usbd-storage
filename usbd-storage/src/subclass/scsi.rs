@@ -277,6 +277,26 @@ impl<'alloc, Bus: UsbBus + 'alloc, Buf: BorrowMut<[u8]>> Scsi<BulkOnly<'alloc, B
 
         Ok(())
     }
+
+    /// Makes OUT data phases wait for the subclass, see [BulkOnly::enable_zero_copy].
+    #[cfg(feature = "transfer")]
+    pub fn enable_zero_copy(&mut self) {
+        self.transport.enable_zero_copy();
+    }
+
+    /// Retires a finished zero-copy transfer, see [BulkOnly::poll_data_transfer].
+    ///
+    /// The callback of [poll_command] is not called again once the command has a status,
+    /// so a subclass that sets the status with transfers still queued retires them here.
+    ///
+    /// [poll_command]: Scsi::poll_command
+    #[cfg(feature = "transfer")]
+    pub fn poll_data_transfer<B: crate::transfer::TransferBus>(
+        &mut self,
+        bus: &B,
+    ) -> Result<Option<crate::transfer::Retired>, TransportError<BulkOnlyError>> {
+        self.transport.poll_data_transfer(bus)
+    }
 }
 
 impl<Bus, T> UsbClass<Bus> for Scsi<T>

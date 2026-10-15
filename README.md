@@ -23,6 +23,7 @@ This crate has a couple of opt-in features that all could be used independently.
 | `ufi`                 | Include USB Floppy Interface subclass                            |
 | `defmt`               | Enable logging via [defmt](https://crates.io/crates/defmt) crate |
 | `extended_addressing` | Enable commands that support 64-bit LBA and 32-bit LEN           |
+| `transfer`            | Zero-copy data phases through a bus driver's transfer queue      |
 
 # Examples
 See [examples](examples)

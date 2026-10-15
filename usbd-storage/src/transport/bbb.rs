@@ -13,6 +13,11 @@ use usb_device::class_prelude::DescriptorWriter;
 use usb_device::control::{Recipient, RequestType};
 use usb_device::endpoint::{Endpoint, In, Out};
 
+#[cfg(feature = "transfer")]
+mod zero_copy;
+#[cfg(feature = "transfer")]
+pub use zero_copy::SubmitRejected;
+
 /// Bulk Only Transport interface protocol
 pub(crate) const TRANSPORT_BBB: u8 = 0x50;
 
@@ -117,6 +122,8 @@ pub struct BulkOnly<'alloc, Bus: UsbBus, Buf: BorrowMut<[u8]>> {
     cs: Option<StatusAndResidue>,
     max_lun: u8,
     left_to_transfer: u32,
+    #[cfg(feature = "transfer")]
+    zero_copy: zero_copy::ZeroCopy,
 }
 
 impl<'alloc, Bus, Buf> BulkOnly<'alloc, Bus, Buf>
@@ -167,6 +174,8 @@ where
             cs: Default::default(),
             max_lun,
             left_to_transfer: 0,
+            #[cfg(feature = "transfer")]
+            zero_copy: Default::default(),
         })
     }
 
@@ -228,6 +237,8 @@ where
         ) {
             return Err(TransportError::Error(BulkOnlyError::InvalidState));
         }
+        #[cfg(feature = "transfer")]
+        self.take_per_packet_data_out()?;
 
         Ok(self
             .buf
@@ -254,6 +265,8 @@ where
         if !matches!(self.state, State::DataTransferToHost) {
             return Err(TransportError::Error(BulkOnlyError::InvalidState));
         }
+        #[cfg(feature = "transfer")]
+        self.forbid_staging_in_zero_copy_phase()?;
 
         let allowed_to_write = self.allowed_to_append_to_data_transfer();
 
@@ -277,6 +290,8 @@ where
         if !matches!(self.state, State::DataTransferToHost) {
             return Err(TransportError::Error(BulkOnlyError::InvalidState));
         }
+        #[cfg(feature = "transfer")]
+        self.forbid_staging_in_zero_copy_phase()?;
 
         if src.len() > self.allowed_to_append_to_data_transfer() {
             return Err(TransportError::Error(BulkOnlyError::TransferLengthExceeded));
@@ -305,6 +320,8 @@ where
         self.in_ep.unstall();
         self.out_ep.unstall();
         self.buf.clear();
+        #[cfg(feature = "transfer")]
+        self.zero_copy.end_data_phase();
 
         self.state = State::CommandTransfer;
         trace!("usb: bbb: enter {:?}", self.state);
@@ -332,6 +349,8 @@ where
         self.cs = None;
         self.left_to_transfer = 0;
         self.buf.clear();
+        #[cfg(feature = "transfer")]
+        self.zero_copy.end_data_phase();
 
         self.state = State::CommandTransfer;
         trace!("usb: bbb: mass storage reset, enter {:?}", self.state);
@@ -439,6 +458,11 @@ where
         assert_matches!(self.state, State::DataTransferToHost);
         self.assert_buffer_len_not_exceeding();
 
+        #[cfg(feature = "transfer")]
+        if self.zero_copy_holds_data_phase() {
+            return Ok(());
+        }
+
         // data is all sent. wait for the status
         if self.left_to_transfer == 0 {
             self.enter_state_data_transfer_status_await();
@@ -523,6 +547,11 @@ where
     /// Actively keep reading bytes if there is no status set
     fn handle_data_transfer_from_host(&mut self) -> BulkOnlyTransportResult<()> {
         assert_matches!(self.state, State::DataTransferFromHost);
+
+        #[cfg(feature = "transfer")]
+        if self.zero_copy_holds_data_phase() {
+            return Ok(());
+        }
 
         // data is all read. wait for the status
         if self.left_to_transfer == 0 {
@@ -1165,11 +1194,11 @@ mod tests {
         assert_eq!(bbb.buf.available_read(), 0);
     }
 
-    const PACKET_SIZES: [u16; 4] = [8, 16, 32, 64];
+    pub(super) const PACKET_SIZES: [u16; 4] = [8, 16, 32, 64];
 
     /// What the host expects: Spec. 6.7's Hn / Hi / Ho.
     #[derive(Copy, Clone)]
-    enum Host {
+    pub(super) enum Host {
         NoData,  // Hn
         DataIn,  // Hi: device -> host
         DataOut, // Ho: host -> device
@@ -1177,12 +1206,12 @@ mod tests {
 
     /// Queues shared between the test and the bus moved into the allocator.
     #[derive(Clone, Default)]
-    struct Shared {
-        out: Arc<Mutex<VecDeque<Vec<u8>>>>, // host -> device packets
-        input: Arc<Mutex<Vec<Vec<u8>>>>,    // device -> host packets
+    pub(super) struct Shared {
+        pub(super) out: Arc<Mutex<VecDeque<Vec<u8>>>>, // host -> device packets
+        pub(super) input: Arc<Mutex<Vec<Vec<u8>>>>,    // device -> host packets
     }
 
-    struct MockBus {
+    pub(super) struct MockBus {
         shared: Shared,
     }
 
@@ -1228,9 +1257,9 @@ mod tests {
         }
     }
 
-    type MockBbb = BulkOnly<'static, MockBus, Vec<u8>>;
+    pub(super) type MockBbb = BulkOnly<'static, MockBus, Vec<u8>>;
 
-    fn new_bbb(packet_size: u16) -> (Shared, MockBbb) {
+    pub(super) fn new_bbb(packet_size: u16) -> (Shared, MockBbb) {
         let shared = Shared::default();
         let bus = MockBus {
             shared: shared.clone(),
@@ -1244,7 +1273,7 @@ mod tests {
     }
 
     /// Builds a CBW. `data_len` of 0 yields a no-data command.
-    fn cbw(data_len: u32, host: Host) -> Vec<u8> {
+    pub(super) fn cbw(data_len: u32, host: Host) -> Vec<u8> {
         let mut c = vec![0u8; CBW_LEN];
         c[..4].copy_from_slice(&0x43425355u32.to_le_bytes());
         c[4..8].copy_from_slice(&1u32.to_le_bytes()); // tag
@@ -1260,7 +1289,7 @@ mod tests {
     }
 
     /// Splits `bytes` into `packet_size` OUT packets the device will read.
-    fn enqueue(shared: &Shared, bytes: &[u8], packet_size: u16) {
+    pub(super) fn enqueue(shared: &Shared, bytes: &[u8], packet_size: u16) {
         let mut out = shared.out.lock().unwrap();
         for chunk in bytes.chunks(packet_size as usize) {
             out.push_back(chunk.to_vec());
@@ -1320,7 +1349,7 @@ mod tests {
         )
     }
 
-    fn is_invalid_state<T>(r: Result<T, TransportError<BulkOnlyError>>) -> bool {
+    pub(super) fn is_invalid_state<T>(r: Result<T, TransportError<BulkOnlyError>>) -> bool {
         matches!(r, Err(TransportError::Error(BulkOnlyError::InvalidState)))
     }
 }

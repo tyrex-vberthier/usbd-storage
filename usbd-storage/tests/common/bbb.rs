@@ -211,6 +211,26 @@ impl DummyUsbBus {
         (!lock.ep0.stalled).then(|| lock.ep0.data_in.clone())
     }
 
+    /// How many bytes the device has read from the OUT endpoint
+    #[cfg(feature = "transfer")]
+    pub fn out_bytes_read(&self) -> usize {
+        let lock = self.inner.lock().unwrap();
+        lock.ep_out.as_ref().map_or(0, |ep| ep.bytes_read)
+    }
+
+    /// Takes everything the host has sent and the device has not read, as a DMA
+    /// transfer on the OUT endpoint would
+    #[cfg(feature = "transfer")]
+    pub fn take_out_data(&self) -> Vec<u8> {
+        let mut lock = self.inner.lock().unwrap();
+        let ep = lock.ep_out.as_mut().unwrap();
+        let mut bytes = vec![];
+        while let Some(mut packet) = ep.read_packet() {
+            bytes.append(&mut packet);
+        }
+        bytes
+    }
+
     pub fn bytes_processed(&self) -> BytesProcessed {
         let lock = self.inner.lock().unwrap();
         BytesProcessed {

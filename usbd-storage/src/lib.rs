@@ -16,6 +16,7 @@
 //! | `scsi` | Include SCSI subclass                 |
 //! | `ufi` | Include USB Floppy Interface subclass |
 //! | `defmt` | Enable logging via [defmt](https://crates.io/crates/defmt) crate |
+//! | `transfer` | Zero-copy data phases through a bus driver's transfer queue |
 //!
 //! [usb-device]: https://crates.io/crates/usb-device
 //! [Vendor Specific subclass]: crate::subclass

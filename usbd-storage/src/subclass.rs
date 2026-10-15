@@ -4,6 +4,11 @@
 use crate::subclass::scsi::{Scsi, ScsiCommand};
 #[cfg(all(feature = "bbb", feature = "ufi"))]
 use crate::subclass::ufi::{Ufi, UfiCommand};
+#[cfg(all(feature = "scsi", feature = "bbb", feature = "transfer"))]
+use crate::{
+    transfer::{Retired, TransferBus},
+    transport::bbb::SubmitRejected,
+};
 #[cfg(all(any(feature = "scsi", feature = "ufi"), feature = "bbb"))]
 use {
     crate::transport::bbb::{BulkOnly, BulkOnlyError},
@@ -119,6 +124,37 @@ impl<'a, 'alloc, Bus: UsbBus + 'alloc, Buf: BorrowMut<[u8]>>
     /// [crate::transport::bbb::BulkOnly::try_write_data_all]
     pub fn try_write_data_all(&mut self, src: &[u8]) -> Result<(), TransportError<BulkOnlyError>> {
         self.class.transport.try_write_data_all(src)
+    }
+
+    /// [crate::transport::bbb::BulkOnly::submit_data_in]
+    #[cfg(feature = "transfer")]
+    pub fn submit_data_in<B: TransferBus>(
+        &mut self,
+        bus: &B,
+        buf: &'static mut [u8],
+        len: usize,
+    ) -> Result<(), SubmitRejected> {
+        self.class.transport.submit_data_in(bus, buf, len)
+    }
+
+    /// [crate::transport::bbb::BulkOnly::submit_data_out]
+    #[cfg(feature = "transfer")]
+    pub fn submit_data_out<B: TransferBus>(
+        &mut self,
+        bus: &B,
+        buf: &'static mut [u8],
+        len: usize,
+    ) -> Result<(), SubmitRejected> {
+        self.class.transport.submit_data_out(bus, buf, len)
+    }
+
+    /// [crate::transport::bbb::BulkOnly::poll_data_transfer]
+    #[cfg(feature = "transfer")]
+    pub fn poll_data_transfer<B: TransferBus>(
+        &mut self,
+        bus: &B,
+    ) -> Result<Option<Retired>, TransportError<BulkOnlyError>> {
+        self.class.transport.poll_data_transfer(bus)
     }
 
     /// Mark command as successful (0x00)
