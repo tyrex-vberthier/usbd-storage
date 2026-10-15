@@ -29,6 +29,7 @@ bbb = []
 ufi = []
 scsi = []
 extended_addressing = []
+transfer = []
 
 [[test]]
 name = "scsi_bbb"
