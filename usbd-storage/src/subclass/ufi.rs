@@ -42,14 +42,26 @@ const WRITE_10: u8 = 0x2A;
 const WRITE_12: u8 = 0xAA;
 const WRITE_AND_VERIFY: u8 = 0x2E;
 
+/// The 1-based sector, within its track, of logical block `lba`.
+///
+/// # Panics
+/// Panics if `sec_trk` is 0.
 pub fn lba_to_sector(lba: u32, sec_trk: u8) -> u32 {
     lba % sec_trk as u32 + 1
 }
 
+/// The head that reads logical block `lba`.
+///
+/// # Panics
+/// Panics if `sec_trk` or `head_trk` is 0.
 pub fn lba_to_head(lba: u32, sec_trk: u8, head_trk: u8) -> u32 {
     (lba / sec_trk as u32) % head_trk as u32
 }
 
+/// The track (cylinder) that holds logical block `lba`.
+///
+/// # Panics
+/// Panics if `sec_trk` or `head_trk` is 0.
 pub fn lba_to_track(lba: u32, sec_trk: u8, head_trk: u8) -> u32 {
     (lba / sec_trk as u32) / head_trk as u32
 }

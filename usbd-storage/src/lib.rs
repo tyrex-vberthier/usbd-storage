@@ -16,6 +16,7 @@
 //! | `scsi` | Include SCSI subclass                 |
 //! | `ufi` | Include USB Floppy Interface subclass |
 //! | `defmt` | Enable logging via [defmt](https://crates.io/crates/defmt) crate |
+//! | `extended_addressing` | Enable commands that support 64-bit LBA and 32-bit LEN |
 //!
 //! [usb-device]: https://crates.io/crates/usb-device
 //! [Vendor Specific subclass]: crate::subclass
