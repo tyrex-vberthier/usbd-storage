@@ -273,6 +273,77 @@ fn class_requests_for_another_interface_are_left_alone() {
     );
 }
 
+/// A firmware that filters or sends requests per interface reads the number the class
+/// answers to from `interface()`, so it must be the one `wIndex` has to carry. Two
+/// sibling interfaces around the class keep a hard-coded 0 or 1 from passing.
+#[test]
+fn interface_is_the_one_the_class_answers_to() {
+    let mut io_buf = [0u8; 1024];
+    let bus = DummyUsbBus::new();
+    let alloc = UsbBusAllocator::new(bus.clone());
+    let before = u8::from(alloc.interface());
+    let mut scsi = Scsi::new(&alloc, 64, 0, io_buf.as_mut_slice()).unwrap();
+    let after = u8::from(alloc.interface());
+    let mut device = UsbDeviceBuilder::new(&alloc, UsbVidPid(0xabcd, 0xabcd)).build();
+
+    let ours = u8::from(scsi.interface());
+    assert_eq!(
+        (before, ours, after),
+        (0, 1, 2),
+        "the class should hold the interface allocated between its siblings"
+    );
+
+    let get_max_lun = |index: u8| setup(0xA1, 0xFE, 0, u16::from(index), 1);
+    assert_eq!(
+        bus.control(&mut device, &mut scsi, get_max_lun(ours)),
+        Some(vec![0]),
+        "GET MAX LUN for interface() should be answered"
+    );
+    for other in [before, after] {
+        assert_eq!(
+            bus.control(&mut device, &mut scsi, get_max_lun(other)),
+            None,
+            "GET MAX LUN for sibling interface {other} should be refused"
+        );
+    }
+}
+
+/// [`interface_is_the_one_the_class_answers_to`], for UFI.
+#[cfg(feature = "ufi")]
+#[test]
+fn ufi_interface_is_the_one_the_class_answers_to() {
+    use usbd_storage::subclass::ufi::Ufi;
+
+    let mut io_buf = [0u8; 1024];
+    let bus = DummyUsbBus::new();
+    let alloc = UsbBusAllocator::new(bus.clone());
+    let before = u8::from(alloc.interface());
+    let mut ufi = Ufi::new(&alloc, 64, io_buf.as_mut_slice()).unwrap();
+    let after = u8::from(alloc.interface());
+    let mut device = UsbDeviceBuilder::new(&alloc, UsbVidPid(0xabcd, 0xabcd)).build();
+
+    let ours = u8::from(ufi.interface());
+    assert_eq!(
+        (before, ours, after),
+        (0, 1, 2),
+        "the class should hold the interface allocated between its siblings"
+    );
+
+    let get_max_lun = |index: u8| setup(0xA1, 0xFE, 0, u16::from(index), 1);
+    assert_eq!(
+        bus.control(&mut device, &mut ufi, get_max_lun(ours)),
+        Some(vec![0]),
+        "GET MAX LUN for interface() should be answered"
+    );
+    for other in [before, after] {
+        assert_eq!(
+            bus.control(&mut device, &mut ufi, get_max_lun(other)),
+            None,
+            "GET MAX LUN for sibling interface {other} should be refused"
+        );
+    }
+}
+
 /// Drive the device until it has no IO left to do
 fn drive(bus: &DummyUsbBus, scsi: &mut Scsi<BulkOnly<DummyUsbBus, &mut [u8]>>) {
     let mut bytes_processed = bus.bytes_processed();

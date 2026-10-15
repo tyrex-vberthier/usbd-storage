@@ -59,6 +59,15 @@ where
         })
     }
 
+    /// The interface number the class allocated in `new`, shared by both alternate
+    /// settings.
+    ///
+    /// It is the `wIndex` of the Bulk-Only class requests the class answers on
+    /// alternate setting 0.
+    pub fn interface(&self) -> InterfaceNumber {
+        self.bot.interface()
+    }
+
     /// The active alternate setting: 0 for BOT, 1 for UAS.
     pub fn active_alt(&self) -> u8 {
         self.active_alt
@@ -395,6 +404,26 @@ mod tests {
         assert!(class.set_alt_setting(ours, 1), "UAS");
         assert_eq!(class.get_alt_setting(ours), Some(1));
         assert_eq!(class.active_alt(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn interface_is_the_one_the_class_answers_to() -> TestResult {
+        let (bus, mut class, other, mut device) = new_device();
+        let ours = class.interface();
+
+        assert!(ours != other, "a sibling interface is a different number");
+        assert_eq!(class.get_alt_setting(ours), Some(0), "the class owns it");
+        assert_eq!(
+            control(
+                &bus,
+                &mut device,
+                &mut class,
+                setup(0xA1, 0xFE, 0, u16::from(u8::from(ours)), 1)
+            ),
+            Some(vec![0]),
+            "GET MAX LUN for interface() is answered"
+        );
         Ok(())
     }
 

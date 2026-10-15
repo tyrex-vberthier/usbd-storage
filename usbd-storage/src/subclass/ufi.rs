@@ -204,6 +204,16 @@ pub struct Ufi<T: Transport> {
     pub(crate) transport: T,
 }
 
+impl<T: Transport> Ufi<T> {
+    /// The interface number the class allocated in `new`.
+    ///
+    /// It is the `wIndex` of the class requests the class answers, and the one
+    /// its interface descriptor carries.
+    pub fn interface(&self) -> InterfaceNumber {
+        self.interface
+    }
+}
+
 /// UFI subclass implementation with [Bulk Only Transport]
 ///
 /// [Bulk Only Transport]: crate::transport::bbb::BulkOnly

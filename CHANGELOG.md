@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `uas` feature: `ScsiUas`, a SCSI class offering BOT on alternate setting 0 and UAS on alternate setting 1, and the `Uas` transport engine behind it
 - `uas` feature: the UAS Information Unit codec and command tag table
 - `transfer` feature: the `TransferBus` trait, and zero-copy data phases for `BulkOnly` (`enable_zero_copy`, `submit_data_in`, `submit_data_out`, `poll_data_transfer`)
+- `Scsi::interface`, `Ufi::interface` and `ScsiUas::interface`: the interface number the class allocated, which is the `wIndex` its Bulk-Only class requests must carry
 - `Transport::control_out`, defaulted to ignoring the request (https://github.com/apohrebniak/usbd-storage/pull/36)
 
 ### Fixed
@@ -74,4 +75,3 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [0.2.0]: https://github.com/apohrebniak/usbd-storage/releases/tag/v0.2.0
 [0.1.1]: https://github.com/apohrebniak/usbd-storage/releases/tag/v0.1.1
 [0.1.0]: https://github.com/apohrebniak/usbd-storage/releases/tag/v0.1.0
-
