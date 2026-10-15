@@ -8,6 +8,8 @@ use usb_device::descriptor::DescriptorWriter;
 
 #[cfg(feature = "bbb")]
 pub mod bbb;
+#[cfg(feature = "uas")]
+pub mod uas;
 
 /// Interface protocol for specific transports
 pub const TRANSPORT_VENDOR_SPECIFIC: u8 = 0xFF;
