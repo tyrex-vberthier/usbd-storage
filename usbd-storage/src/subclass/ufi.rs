@@ -132,66 +132,69 @@ pub enum UfiCommand {
 
 #[allow(dead_code)]
 fn parse_cb(cb: &[u8]) -> UfiCommand {
-    match cb[0] {
-        REQUEST_SENSE => UfiCommand::RequestSense { alloc_len: cb[4] },
-        INQUIRY => UfiCommand::Inquiry { alloc_len: cb[4] },
-        TEST_UNIT_READY => UfiCommand::TestUnitReady,
-        READ_CAPACITY => UfiCommand::ReadCapacity,
-        PREVENT_ALLOW_MEDIUM_REMOVAL => UfiCommand::PreventAllowMediumRemoval {
+    let Some(&opcode) = cb.first() else {
+        return UfiCommand::Unknown;
+    };
+    // Each arm names the shortest command block that carries the fields it reads, so the
+    // indexing below stays in bounds; anything shorter is an unknown command.
+    let be16 = |at: usize| u16::from_be_bytes([cb[at], cb[at + 1]]);
+    let be32 = |at: usize| u32::from_be_bytes([cb[at], cb[at + 1], cb[at + 2], cb[at + 3]]);
+    match (opcode, cb.len()) {
+        (REQUEST_SENSE, 5..) => UfiCommand::RequestSense { alloc_len: cb[4] },
+        (INQUIRY, 5..) => UfiCommand::Inquiry { alloc_len: cb[4] },
+        (TEST_UNIT_READY, _) => UfiCommand::TestUnitReady,
+        (READ_CAPACITY, _) => UfiCommand::ReadCapacity,
+        (PREVENT_ALLOW_MEDIUM_REMOVAL, 5..) => UfiCommand::PreventAllowMediumRemoval {
             prevent: cb[4] != 0,
         },
-        MODE_SENSE => UfiCommand::ModeSense {
+        (MODE_SENSE, 9..) => UfiCommand::ModeSense {
             page_control: cb[2] >> 6,
             page_code: cb[2] & 0b00111111,
-            param_list_len: u16::from_be_bytes(cb[7..9].try_into().unwrap()),
+            param_list_len: be16(7),
         },
-        READ_10 => UfiCommand::Read {
-            lba: u32::from_be_bytes(cb[2..=5].try_into().unwrap()),
-            len: u16::from_be_bytes(cb[7..=8].try_into().unwrap()) as u32,
+        (READ_10, 9..) => UfiCommand::Read {
+            lba: be32(2),
+            len: u32::from(be16(7)),
         },
-        READ_12 => UfiCommand::Read {
-            lba: u32::from_be_bytes(cb[2..=5].try_into().unwrap()),
-            len: u32::from_be_bytes(cb[6..=9].try_into().unwrap()),
+        (READ_12, 10..) => UfiCommand::Read {
+            lba: be32(2),
+            len: be32(6),
         },
-        WRITE_10 => UfiCommand::Write {
-            lba: u32::from_be_bytes(cb[2..=5].try_into().unwrap()),
-            len: u16::from_be_bytes(cb[7..=8].try_into().unwrap()) as u32,
+        (WRITE_10, 9..) => UfiCommand::Write {
+            lba: be32(2),
+            len: u32::from(be16(7)),
             verify: false,
         },
-        WRITE_12 => UfiCommand::Write {
-            lba: u32::from_be_bytes(cb[2..=5].try_into().unwrap()),
-            len: u32::from_be_bytes(cb[6..=9].try_into().unwrap()),
+        (WRITE_12, 10..) => UfiCommand::Write {
+            lba: be32(2),
+            len: be32(6),
             verify: false,
         },
-        WRITE_AND_VERIFY => UfiCommand::Write {
-            lba: u32::from_be_bytes(cb[2..=5].try_into().unwrap()),
-            len: u16::from_be_bytes(cb[7..=8].try_into().unwrap()) as u32,
+        (WRITE_AND_VERIFY, 9..) => UfiCommand::Write {
+            lba: be32(2),
+            len: u32::from(be16(7)),
             verify: true,
         },
-        FORMAT_UNIT => UfiCommand::FormatUnit {
+        (FORMAT_UNIT, 9..) => UfiCommand::FormatUnit {
             track: cb[2],
-            parameter_list_len: u16::from_be_bytes(cb[7..=8].try_into().unwrap()),
+            parameter_list_len: be16(7),
         },
-        MODE_SELECT => UfiCommand::ModeSelect {
-            parameter_list_len: u16::from_be_bytes(cb[7..=8].try_into().unwrap()),
+        (MODE_SELECT, 9..) => UfiCommand::ModeSelect {
+            parameter_list_len: be16(7),
         },
-        READ_FORMAT_CAPACITIES => UfiCommand::ReadFormatCapacities {
-            alloc_len: u16::from_be_bytes(cb[7..=8].try_into().unwrap()),
-        },
-        REZERO_UNIT => UfiCommand::RezeroUnit,
-        SEEK_10 => UfiCommand::Seek {
-            lba: u32::from_be_bytes(cb[2..=5].try_into().unwrap()),
-        },
-        SEND_DIAGNOSTIC => UfiCommand::SendDiagnostic {
+        (READ_FORMAT_CAPACITIES, 9..) => UfiCommand::ReadFormatCapacities { alloc_len: be16(7) },
+        (REZERO_UNIT, _) => UfiCommand::RezeroUnit,
+        (SEEK_10, 6..) => UfiCommand::Seek { lba: be32(2) },
+        (SEND_DIAGNOSTIC, 2..) => UfiCommand::SendDiagnostic {
             default: cb[1] & 1 << 2 > 0,
         },
-        START_STOP => UfiCommand::StartStop {
+        (START_STOP, 5..) => UfiCommand::StartStop {
             start: cb[4] & 1 > 0,
             eject: cb[4] == 2,
         },
-        VERIFY => UfiCommand::Verify {
-            lba: u32::from_be_bytes(cb[2..=5].try_into().unwrap()),
-            len: u16::from_be_bytes(cb[7..=8].try_into().unwrap()),
+        (VERIFY, 9..) => UfiCommand::Verify {
+            lba: be32(2),
+            len: be16(7),
         },
         _ => UfiCommand::Unknown,
     }
@@ -310,5 +313,197 @@ where
         if let Err(err) = self.transport.poll() {
             trace!("usb: ufi: poll: {}", err);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const OPCODES: [u8; 19] = [
+        FORMAT_UNIT,
+        INQUIRY,
+        MODE_SELECT,
+        MODE_SENSE,
+        PREVENT_ALLOW_MEDIUM_REMOVAL,
+        READ_10,
+        READ_12,
+        READ_CAPACITY,
+        READ_FORMAT_CAPACITIES,
+        REQUEST_SENSE,
+        REZERO_UNIT,
+        SEEK_10,
+        SEND_DIAGNOSTIC,
+        START_STOP,
+        TEST_UNIT_READY,
+        VERIFY,
+        WRITE_10,
+        WRITE_12,
+        WRITE_AND_VERIFY,
+    ];
+
+    /// The CDB length comes from the host's `bCBWCBLength` (1 to 16), not from the
+    /// opcode: a command block too short for its opcode must not panic the device.
+    #[test]
+    fn parse_cb_short_command_blocks_do_not_panic() {
+        for opcode in OPCODES {
+            for len in 1..12 {
+                let mut cb = [0u8; 12];
+                cb[0] = opcode;
+                let _ = parse_cb(&cb[..len]);
+            }
+        }
+        assert!(matches!(parse_cb(&[]), UfiCommand::Unknown));
+    }
+
+    /// A full 12-byte command block whose fields are all different, so a field read
+    /// from the wrong byte shows.
+    fn cdb(opcode: u8) -> [u8; 12] {
+        [
+            opcode, 0x04, 0xC5, 0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0, 0,
+        ]
+    }
+
+    #[test]
+    fn parse_cb_full_command_blocks() {
+        use UfiCommand as C;
+        let p = |op| parse_cb(&cdb(op));
+        assert!(matches!(
+            p(REQUEST_SENSE),
+            C::RequestSense { alloc_len: 0x34 }
+        ));
+        assert!(matches!(p(INQUIRY), C::Inquiry { alloc_len: 0x34 }));
+        assert!(matches!(p(TEST_UNIT_READY), C::TestUnitReady));
+        assert!(matches!(p(READ_CAPACITY), C::ReadCapacity));
+        assert!(matches!(
+            p(MODE_SENSE),
+            C::ModeSense {
+                page_control: 3,
+                page_code: 0x05,
+                param_list_len: 0x9ABC
+            }
+        ));
+        assert!(matches!(
+            p(READ_10),
+            C::Read {
+                lba: 0xC512_3456,
+                len: 0x9ABC
+            }
+        ));
+        assert!(matches!(
+            p(READ_12),
+            C::Read {
+                lba: 0xC512_3456,
+                len: 0x789A_BCDE
+            }
+        ));
+        assert!(matches!(
+            p(WRITE_10),
+            C::Write {
+                lba: 0xC512_3456,
+                len: 0x9ABC,
+                verify: false
+            }
+        ));
+        assert!(matches!(
+            p(WRITE_12),
+            C::Write {
+                lba: 0xC512_3456,
+                len: 0x789A_BCDE,
+                verify: false
+            }
+        ));
+        assert!(matches!(
+            p(WRITE_AND_VERIFY),
+            C::Write {
+                lba: 0xC512_3456,
+                len: 0x9ABC,
+                verify: true
+            }
+        ));
+        assert!(matches!(
+            p(FORMAT_UNIT),
+            C::FormatUnit {
+                track: 0xC5,
+                parameter_list_len: 0x9ABC
+            }
+        ));
+        assert!(matches!(
+            p(MODE_SELECT),
+            C::ModeSelect {
+                parameter_list_len: 0x9ABC
+            }
+        ));
+        assert!(matches!(
+            p(READ_FORMAT_CAPACITIES),
+            C::ReadFormatCapacities { alloc_len: 0x9ABC }
+        ));
+        assert!(matches!(p(REZERO_UNIT), C::RezeroUnit));
+        assert!(matches!(p(SEEK_10), C::Seek { lba: 0xC512_3456 }));
+        assert!(matches!(
+            p(VERIFY),
+            C::Verify {
+                lba: 0xC512_3456,
+                len: 0x9ABC
+            }
+        ));
+        assert!(matches!(p(0xFF), C::Unknown));
+    }
+
+    #[test]
+    fn parse_cb_flag_bits() {
+        use UfiCommand as C;
+        let with = |op: u8, at: usize, value: u8| {
+            let mut cb = cdb(op);
+            cb[at] = value;
+            parse_cb(&cb)
+        };
+        // PREVENT ALLOW MEDIUM REMOVAL: byte 4, any non-zero value prevents
+        assert!(matches!(
+            with(PREVENT_ALLOW_MEDIUM_REMOVAL, 4, 0),
+            C::PreventAllowMediumRemoval { prevent: false }
+        ));
+        assert!(matches!(
+            with(PREVENT_ALLOW_MEDIUM_REMOVAL, 4, 1),
+            C::PreventAllowMediumRemoval { prevent: true }
+        ));
+        // SEND DIAGNOSTIC: SelfTest, byte 1 bit 2
+        assert!(matches!(
+            with(SEND_DIAGNOSTIC, 1, 0b100),
+            C::SendDiagnostic { default: true }
+        ));
+        assert!(matches!(
+            with(SEND_DIAGNOSTIC, 1, 0b011),
+            C::SendDiagnostic { default: false }
+        ));
+        // START STOP UNIT: Start is byte 4 bit 0, eject is LoEj without Start
+        assert!(matches!(
+            with(START_STOP, 4, 0b01),
+            C::StartStop {
+                start: true,
+                eject: false
+            }
+        ));
+        assert!(matches!(
+            with(START_STOP, 4, 0b10),
+            C::StartStop {
+                start: false,
+                eject: true
+            }
+        ));
+        assert!(matches!(
+            with(START_STOP, 4, 0b11),
+            C::StartStop {
+                start: true,
+                eject: false
+            }
+        ));
+        assert!(matches!(
+            with(START_STOP, 4, 0b00),
+            C::StartStop {
+                start: false,
+                eject: false
+            }
+        ));
     }
 }
