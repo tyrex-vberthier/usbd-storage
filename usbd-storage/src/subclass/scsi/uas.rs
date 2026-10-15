@@ -150,17 +150,19 @@ where
         self.active_alt = 0;
     }
 
-    /// GET MAX LUN, on alternate setting 0.
+    /// GET MAX LUN, on alternate setting 0. Through [Scsi], which leaves a
+    /// request for another interface alone.
     fn control_in(&mut self, xfer: ControlIn<Bus>) {
         if self.active_alt == 0 {
-            self.bot.transport.control_in(xfer);
+            self.bot.control_in(xfer);
         }
     }
 
-    /// The Bulk-Only Mass Storage Reset, on alternate setting 0.
+    /// The Bulk-Only Mass Storage Reset, on alternate setting 0. Through [Scsi],
+    /// which leaves a request for another interface alone.
     fn control_out(&mut self, xfer: ControlOut<Bus>) {
         if self.active_alt == 0 {
-            self.bot.transport.control_out(xfer);
+            self.bot.control_out(xfer);
         }
     }
 
@@ -578,6 +580,42 @@ mod tests {
             control(&bus, &mut device, &mut class, reset),
             None,
             "no Mass Storage Reset on alt 1"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn bot_class_requests_for_another_interface_are_left_alone() -> TestResult {
+        let (bus, mut class, other, mut device) = new_device();
+        let theirs = u16::from(u8::from(other));
+
+        assert_eq!(
+            control(
+                &bus,
+                &mut device,
+                &mut class,
+                setup(0xA1, 0xFE, 0, theirs, 1)
+            ),
+            None,
+            "GET MAX LUN for another interface should be refused"
+        );
+
+        let (_, bot_out) = class.data_pipe_addresses();
+        host_sends(&bus, bot_out, cbw());
+        class.poll();
+        assert_eq!(
+            control(
+                &bus,
+                &mut device,
+                &mut class,
+                setup(0x21, 0xFF, 0, theirs, 0)
+            ),
+            None,
+            "a Mass Storage Reset for another interface should be refused"
+        );
+        assert!(
+            class.bot.transport.get_command().is_some(),
+            "a Mass Storage Reset for another interface should leave the command in flight"
         );
         Ok(())
     }
