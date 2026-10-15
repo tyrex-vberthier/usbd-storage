@@ -506,4 +506,154 @@ mod tests {
             }
         ));
     }
+
+    /// LBA to cylinder/head/sector on a 1.44 MB floppy: 18 sectors per track, 2 heads.
+    #[test]
+    fn lba_to_chs() {
+        let chs = |lba| {
+            (
+                lba_to_track(lba, 18, 2),
+                lba_to_head(lba, 18, 2),
+                lba_to_sector(lba, 18),
+            )
+        };
+        assert_eq!(chs(0), (0, 0, 1), "sectors count from 1");
+        assert_eq!(chs(17), (0, 0, 18), "last sector of the first track");
+        assert_eq!(chs(18), (0, 1, 1), "second head");
+        assert_eq!(chs(36), (1, 0, 1), "second cylinder");
+        assert_eq!(chs(2879), (79, 1, 18), "last sector of the disk");
+    }
+
+    mod class {
+        use super::*;
+        use crate::test_support::{HostBus, allocator, control, device, setup, summary};
+        use usb_device::device::UsbDevice;
+        use usb_device::endpoint::EndpointAddress;
+
+        type Class = Ufi<BulkOnly<'static, HostBus, Vec<u8>>>;
+
+        const IN_EP: u8 = 0x81;
+        const OUT_EP: u8 = 0x02;
+
+        fn new_class() -> (HostBus, Class, UsbDevice<'static, HostBus>) {
+            let (bus, alloc) = allocator();
+            let class = Ufi::new(alloc, 64, vec![0u8; 512]).unwrap();
+            let device = device(alloc);
+            (bus, class, device)
+        }
+
+        /// A CBW for TEST UNIT READY with `len` bytes of data in direction `dir_in`.
+        fn cbw(len: u32, dir_in: bool) -> Vec<u8> {
+            let mut c = vec![0u8; 31];
+            c[..4].copy_from_slice(&0x4342_5355u32.to_le_bytes());
+            c[8..12].copy_from_slice(&len.to_le_bytes());
+            c[12] = if dir_in { 0x80 } else { 0 };
+            c[14] = 12;
+            c
+        }
+
+        fn poll(class: &mut Class, device: &mut UsbDevice<'static, HostBus>) {
+            for _ in 0..8 {
+                device.poll(&mut [&mut *class]);
+                class.poll();
+            }
+        }
+
+        /// Sends `cbw` (and `data`), runs `handle` on the command, and returns what the
+        /// device sent back: the data, then the CSW as (status, residue).
+        fn run(
+            cbw: Vec<u8>,
+            data: &[u8],
+            handle: impl FnMut(Command<UfiCommand, Class>) -> Result<(), TransportError<BulkOnlyError>>,
+        ) -> (Vec<u8>, (u8, u32)) {
+            let (bus, mut class, mut device) = new_class();
+            let (in_ep, out_ep) = (EndpointAddress::from(IN_EP), EndpointAddress::from(OUT_EP));
+            bus.send(out_ep, &cbw);
+            if !data.is_empty() {
+                bus.send(out_ep, data);
+            }
+            poll(&mut class, &mut device);
+            class.poll_command(handle).unwrap();
+            poll(&mut class, &mut device);
+            let mut sent = bus.received(in_ep);
+            let csw = sent.split_off(sent.len() - 13);
+            (
+                sent,
+                (csw[12], u32::from_le_bytes(csw[8..12].try_into().unwrap())),
+            )
+        }
+
+        #[test]
+        fn descriptors_max_lun_and_reset() {
+            let (bus, mut class, mut device) = new_class();
+            let iface = u8::from(class.interface);
+
+            let config = control(
+                &bus,
+                &mut device,
+                &mut class,
+                setup(0x80, 6, 0x0200, 0, 255),
+            )
+            .expect("GET_DESCRIPTOR");
+            assert_eq!(
+                summary(&config)[1..],
+                [
+                    (0x0B, vec![iface, 1, 0x08, 0x04, 0x50]),
+                    (0x04, vec![iface, 0, 2, 0x08, 0x04, 0x50]),
+                    (0x05, vec![IN_EP]),
+                    (0x05, vec![OUT_EP]),
+                ]
+            );
+
+            let max_lun = setup(0xA1, 0xFE, 0, u16::from(iface), 1);
+            assert_eq!(
+                control(&bus, &mut device, &mut class, max_lun),
+                Some(vec![0])
+            );
+
+            bus.send(EndpointAddress::from(OUT_EP), &cbw(0, false));
+            poll(&mut class, &mut device);
+            assert!(class.transport.get_command().is_some(), "a command");
+            bus.reset();
+            device.poll(&mut [&mut class]);
+            assert!(
+                class.transport.get_command().is_none(),
+                "a bus reset drops it"
+            );
+        }
+
+        #[test]
+        fn read_data_and_pass() {
+            let mut got = [0u8; 8];
+            let (_, csw) = run(cbw(8, false), &[1, 2, 3, 4, 5, 6, 7, 8], |mut cmd| {
+                assert!(matches!(cmd.kind, UfiCommand::TestUnitReady));
+                assert_eq!(cmd.read_data(&mut got)?, 8);
+                cmd.pass(8);
+                Ok(())
+            });
+            assert_eq!(got, [1, 2, 3, 4, 5, 6, 7, 8]);
+            assert_eq!(csw, (0, 0));
+        }
+
+        #[test]
+        fn write_data_and_fail() {
+            let (data, csw) = run(cbw(8, true), &[], |mut cmd| {
+                assert_eq!(cmd.write_data(&[1, 2, 3])?, 3);
+                cmd.try_write_data_all(&[4, 5, 6])?;
+                cmd.fail(6);
+                Ok(())
+            });
+            assert_eq!(data[..6], [1, 2, 3, 4, 5, 6]);
+            assert_eq!(csw, (1, 2), "failed, two bytes not processed");
+        }
+
+        #[test]
+        fn fail_phase() {
+            let (_, csw) = run(cbw(0, false), &[], |cmd| {
+                cmd.fail_phase();
+                Ok(())
+            });
+            assert_eq!(csw, (2, 0), "phase error");
+        }
+    }
 }

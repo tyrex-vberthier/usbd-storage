@@ -38,5 +38,8 @@ pub(crate) mod fmt;
 pub mod subclass;
 pub mod transport;
 
+#[cfg(test)]
+pub(crate) mod test_support;
+
 /// USB Mass Storage Class code
 pub const CLASS_MASS_STORAGE: u8 = 0x08;

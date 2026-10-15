@@ -404,4 +404,182 @@ mod tests {
             ScsiCommand::Unknown { cmd } if cmd == MODE_SENSE_6
         ));
     }
+
+    /// Each flag is read from its own bit: a set neighbour must not read as the flag,
+    /// and the flag alone must.
+    #[test]
+    fn parse_cb_flag_bits() {
+        let cdb = |op: u8, b1: u8, b2: u8| {
+            let mut cb = [0u8; 10];
+            cb[0] = op;
+            cb[1] = b1;
+            cb[2] = b2;
+            cb
+        };
+        for (b1, set) in [(0b01, true), (0b10, false)] {
+            assert!(
+                matches!(parse_cb(&cdb(INQUIRY, b1, 0)), ScsiCommand::Inquiry { evpd, .. } if evpd == set),
+                "INQUIRY EVPD from byte 1 = {b1:#04b}"
+            );
+            assert!(
+                matches!(parse_cb(&cdb(REQUEST_SENSE, b1, 0)), ScsiCommand::RequestSense { desc, .. } if desc == set),
+                "REQUEST SENSE DESC from byte 1 = {b1:#04b}"
+            );
+        }
+        for (b1, set) in [(0b1000, true), (0b0111, false)] {
+            assert!(
+                matches!(parse_cb(&cdb(MODE_SENSE_6, b1, 0)), ScsiCommand::ModeSense6 { dbd, .. } if dbd == set),
+                "MODE SENSE(6) DBD from byte 1 = {b1:#06b}"
+            );
+            assert!(
+                matches!(parse_cb(&cdb(MODE_SENSE_10, b1, 0)), ScsiCommand::ModeSense10 { dbd, .. } if dbd == set),
+                "MODE SENSE(10) DBD from byte 1 = {b1:#06b}"
+            );
+        }
+        // byte 2: PC in bits 7-6, page code in bits 5-0
+        assert!(matches!(
+            parse_cb(&cdb(MODE_SENSE_6, 0, 0b1000_0101)),
+            ScsiCommand::ModeSense6 {
+                page_control: PageControl::DefaultValues,
+                page_code: 0x05,
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse_cb(&cdb(MODE_SENSE_10, 0, 0b0111_1010)),
+            ScsiCommand::ModeSense10 {
+                page_control: PageControl::ChangeableValues,
+                page_code: 0x3A,
+                ..
+            }
+        ));
+    }
+
+    mod class {
+        use super::*;
+        use crate::test_support::{HostBus, allocator, control, device, setup, summary};
+        use crate::transport::TransportError;
+        use crate::transport::bbb::{BulkOnly, BulkOnlyError};
+        use usb_device::device::UsbDevice;
+        use usb_device::endpoint::EndpointAddress;
+
+        type Class = Scsi<BulkOnly<'static, HostBus, Vec<u8>>>;
+
+        const IN_EP: u8 = 0x81;
+        const OUT_EP: u8 = 0x02;
+
+        fn new_class() -> (HostBus, Class, UsbDevice<'static, HostBus>) {
+            let (bus, alloc) = allocator();
+            let class = Scsi::new(alloc, 64, 2, vec![0u8; 512]).unwrap();
+            let device = device(alloc);
+            (bus, class, device)
+        }
+
+        /// A CBW for TEST UNIT READY with `len` bytes of data in direction `dir_in`.
+        fn cbw(len: u32, dir_in: bool) -> Vec<u8> {
+            let mut c = vec![0u8; 31];
+            c[..4].copy_from_slice(&0x4342_5355u32.to_le_bytes());
+            c[8..12].copy_from_slice(&len.to_le_bytes());
+            c[12] = if dir_in { 0x80 } else { 0 };
+            c[14] = 6;
+            c
+        }
+
+        fn poll(class: &mut Class, device: &mut UsbDevice<'static, HostBus>) {
+            for _ in 0..8 {
+                device.poll(&mut [&mut *class]);
+                class.poll();
+            }
+        }
+
+        /// The CSW at the end of what the device sent: (status, residue).
+        fn csw(bytes: &[u8]) -> (u8, u32) {
+            let csw = &bytes[bytes.len() - 13..];
+            (csw[12], u32::from_le_bytes(csw[8..12].try_into().unwrap()))
+        }
+
+        #[test]
+        fn descriptors_max_lun_and_reset() {
+            let (bus, mut class, mut device) = new_class();
+            let iface = u8::from(class.interface);
+
+            let config = control(
+                &bus,
+                &mut device,
+                &mut class,
+                setup(0x80, 6, 0x0200, 0, 255),
+            )
+            .expect("GET_DESCRIPTOR");
+            assert_eq!(
+                summary(&config)[1..],
+                [
+                    (0x0B, vec![iface, 1, 0x08, 0x06, 0x50]),
+                    (0x04, vec![iface, 0, 2, 0x08, 0x06, 0x50]),
+                    (0x05, vec![IN_EP]),
+                    (0x05, vec![OUT_EP]),
+                ]
+            );
+
+            let max_lun = setup(0xA1, 0xFE, 0, u16::from(iface), 1);
+            assert_eq!(
+                control(&bus, &mut device, &mut class, max_lun),
+                Some(vec![2])
+            );
+
+            bus.send(EndpointAddress::from(OUT_EP), &cbw(0, false));
+            poll(&mut class, &mut device);
+            assert!(class.transport.get_command().is_some(), "a command");
+            bus.reset();
+            device.poll(&mut [&mut class]);
+            assert!(
+                class.transport.get_command().is_none(),
+                "a bus reset drops it"
+            );
+        }
+
+        #[test]
+        fn commands_read_and_write_through_the_transport() {
+            let (bus, mut class, mut device) = new_class();
+            let (in_ep, out_ep) = (EndpointAddress::from(IN_EP), EndpointAddress::from(OUT_EP));
+
+            // Data-Out: read_data hands the subclass the host's bytes
+            bus.send(out_ep, &cbw(8, false));
+            bus.send(out_ep, &[1, 2, 3, 4, 5, 6, 7, 8]);
+            poll(&mut class, &mut device);
+            let mut got = [0u8; 8];
+            class
+                .poll_command(|mut cmd| {
+                    let n = cmd.read_data(&mut got)?;
+                    cmd.pass(u32::try_from(n).unwrap());
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(got, [1, 2, 3, 4, 5, 6, 7, 8]);
+            poll(&mut class, &mut device);
+            assert_eq!(
+                csw(&bus.received(in_ep)),
+                (0, 0),
+                "passed, nothing left over"
+            );
+
+            // Data-In: try_write_data_all refuses more than the host asked for
+            bus.send(out_ep, &cbw(4, true));
+            poll(&mut class, &mut device);
+            class
+                .poll_command(|mut cmd| {
+                    assert!(matches!(
+                        cmd.try_write_data_all(&[9; 5]),
+                        Err(TransportError::Error(BulkOnlyError::TransferLengthExceeded))
+                    ));
+                    cmd.try_write_data_all(&[9, 8, 7, 6])?;
+                    cmd.pass(4);
+                    Ok(())
+                })
+                .unwrap();
+            poll(&mut class, &mut device);
+            let sent = bus.received(in_ep);
+            assert_eq!(sent[..4], [9, 8, 7, 6], "the data");
+            assert_eq!(csw(&sent), (0, 0));
+        }
+    }
 }
