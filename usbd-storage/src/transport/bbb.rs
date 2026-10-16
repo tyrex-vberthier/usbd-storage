@@ -11,7 +11,7 @@ use usb_device::bus::{UsbBus, UsbBusAllocator};
 use usb_device::class::{ControlIn, ControlOut};
 use usb_device::class_prelude::DescriptorWriter;
 use usb_device::control::{Recipient, RequestType};
-use usb_device::endpoint::{Endpoint, In, Out};
+use usb_device::endpoint::{Endpoint, EndpointAddress, In, Out};
 
 #[cfg(feature = "transfer")]
 mod zero_copy;
@@ -312,6 +312,14 @@ where
     /// Whether a Command Status has been set
     pub fn has_status(&self) -> bool {
         self.cs.is_some()
+    }
+
+    /// Addresses of the bulk endpoints, as `[bulk IN, bulk OUT]`.
+    ///
+    /// They are the endpoints whose data toggles a firmware resets on `SET_INTERFACE`
+    /// (USB 2.0 §9.1.1.5), since `usb-device`'s [`UsbBus`] has no toggle operation.
+    pub fn endpoint_addresses(&self) -> [EndpointAddress; 2] {
+        [self.in_ep.address(), self.out_ep.address()]
     }
 
     /// The bulk data endpoints, which the UAS alternate setting shares with this one.

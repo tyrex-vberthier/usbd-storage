@@ -344,6 +344,68 @@ fn ufi_interface_is_the_one_the_class_answers_to() {
     }
 }
 
+/// The addresses of the endpoint descriptors in a configuration descriptor, in order.
+fn described_endpoints(config: &[u8]) -> Vec<u8> {
+    let mut out = vec![];
+    let mut at = 0;
+    while let Some(&len) = config.get(at) {
+        let descriptor = &config[at..at + usize::from(len)];
+        if descriptor[1] == 0x05 {
+            out.push(descriptor[2]);
+        }
+        at += usize::from(len);
+    }
+    out
+}
+
+/// A firmware resets the data toggles of the endpoints `endpoint_addresses` returns on
+/// `SET_INTERFACE`, so they must be the ones the host sees in the descriptors.
+#[test]
+fn endpoint_addresses_are_those_the_descriptors_carry() {
+    let mut io_buf = [0u8; 1024];
+    let bus = DummyUsbBus::new();
+    let alloc = UsbBusAllocator::new(bus.clone());
+    let mut scsi = Scsi::new(&alloc, 64, 0, io_buf.as_mut_slice()).unwrap();
+    let mut device = UsbDeviceBuilder::new(&alloc, UsbVidPid(0xabcd, 0xabcd)).build();
+
+    let config = bus
+        .control(&mut device, &mut scsi, setup(0x80, 6, 0x0200, 0, 255))
+        .expect("GET_DESCRIPTOR should be answered");
+
+    let [bulk_in, bulk_out] = scsi.endpoint_addresses().map(u8::from);
+    assert_eq!(
+        described_endpoints(&config),
+        [bulk_in, bulk_out],
+        "bulk IN then bulk OUT, as the endpoint descriptors list them"
+    );
+    assert_ne!(bulk_in, bulk_out, "the two endpoints are distinct");
+}
+
+/// [`endpoint_addresses_are_those_the_descriptors_carry`], for UFI.
+#[cfg(feature = "ufi")]
+#[test]
+fn ufi_endpoint_addresses_are_those_the_descriptors_carry() {
+    use usbd_storage::subclass::ufi::Ufi;
+
+    let mut io_buf = [0u8; 1024];
+    let bus = DummyUsbBus::new();
+    let alloc = UsbBusAllocator::new(bus.clone());
+    let mut ufi = Ufi::new(&alloc, 64, io_buf.as_mut_slice()).unwrap();
+    let mut device = UsbDeviceBuilder::new(&alloc, UsbVidPid(0xabcd, 0xabcd)).build();
+
+    let config = bus
+        .control(&mut device, &mut ufi, setup(0x80, 6, 0x0200, 0, 255))
+        .expect("GET_DESCRIPTOR should be answered");
+
+    let [bulk_in, bulk_out] = ufi.endpoint_addresses().map(u8::from);
+    assert_eq!(
+        described_endpoints(&config),
+        [bulk_in, bulk_out],
+        "bulk IN then bulk OUT, as the endpoint descriptors list them"
+    );
+    assert_ne!(bulk_in, bulk_out, "the two endpoints are distinct");
+}
+
 /// Drive the device until it has no IO left to do
 fn drive(bus: &DummyUsbBus, scsi: &mut Scsi<BulkOnly<DummyUsbBus, &mut [u8]>>) {
     let mut bytes_processed = bus.bytes_processed();

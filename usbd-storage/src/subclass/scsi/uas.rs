@@ -99,6 +99,24 @@ where
         let (data_in, data_out) = self.bot.transport.data_endpoints();
         (data_in.address(), data_out.address())
     }
+
+    /// Addresses of every endpoint the interface allocated, across both alternate
+    /// settings, as `[data IN, data OUT, status IN, command OUT]`: the order of the
+    /// alternate setting 1 descriptors.
+    ///
+    /// They are the endpoints whose data toggles a firmware resets on `SET_INTERFACE`
+    /// (USB 2.0 §9.1.1.5): `usb-device`'s [`UsbBus`] has no toggle operation, so only
+    /// the controller driver can. The data pair is the one [`Self::data_pipe_addresses`]
+    /// returns.
+    pub fn endpoint_addresses(&self) -> [EndpointAddress; 4] {
+        let (data_in, data_out) = self.data_pipe_addresses();
+        [
+            data_in,
+            data_out,
+            self.uas.status_ep.address(),
+            self.uas.cmd_ep.address(),
+        ]
+    }
 }
 
 impl<'alloc, Bus, Buf> UsbClass<Bus> for ScsiUas<'alloc, Bus, Buf>
@@ -565,6 +583,58 @@ mod tests {
                 pipe(1),
             ],
             "BOT on alt 0, UAS on alt 1 with its pipe usage descriptors"
+        );
+        Ok(())
+    }
+
+    /// A firmware resets the data toggles of the endpoints `endpoint_addresses` returns
+    /// on `SET_INTERFACE`, so they must be the ones the host sees: the endpoint
+    /// descriptors of alternate setting 1, which list the shared data pair too.
+    #[test]
+    fn endpoint_addresses_are_those_of_the_alternate_setting_1_descriptors() -> TestResult {
+        let (bus, mut class, _other, mut device) = new_device();
+        let config = control(
+            &bus,
+            &mut device,
+            &mut class,
+            setup(0x80, 6, 0x0200, 0, 255),
+        )
+        .ok_or("GET_DESCRIPTOR refused")?;
+
+        let mut alt = None;
+        let mut described = vec![];
+        for (kind, bytes) in summary(&config) {
+            match (kind, bytes.as_slice()) {
+                (0x04, [_, number, ..]) => alt = Some(*number),
+                (0x05, [address]) if alt == Some(1) => described.push(*address),
+                _ => {}
+            }
+        }
+
+        let addresses = class.endpoint_addresses().map(u8::from);
+        assert_eq!(
+            addresses.as_slice(),
+            described.as_slice(),
+            "data in, data out, status, command: the alternate setting 1 order"
+        );
+        for (i, a) in addresses.iter().enumerate() {
+            assert!(
+                !addresses[..i].contains(a),
+                "endpoint {a:#04x} is allocated twice"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn endpoint_addresses_extend_the_data_pipe_pair() -> TestResult {
+        let (_bus, class) = new_class();
+        let (data_in, data_out) = class.data_pipe_addresses();
+
+        assert_eq!(
+            class.endpoint_addresses()[..2],
+            [data_in, data_out],
+            "the shared data pipes come first"
         );
         Ok(())
     }

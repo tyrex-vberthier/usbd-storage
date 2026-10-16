@@ -19,6 +19,7 @@ use {
     crate::transport::bbb::{BulkOnly, BulkOnlyError},
     core::borrow::BorrowMut,
     usb_device::bus::UsbBusAllocator,
+    usb_device::endpoint::EndpointAddress,
 };
 
 /// SCSI device subclass code
@@ -256,6 +257,15 @@ impl<'alloc, Bus: UsbBus + 'alloc, Buf: BorrowMut<[u8]>> Scsi<BulkOnly<'alloc, B
             interface: alloc.interface(),
             transport,
         })
+    }
+
+    /// Addresses of the interface's endpoints, as `[bulk IN, bulk OUT]`.
+    ///
+    /// They are the endpoints whose data toggles a firmware resets on `SET_INTERFACE`
+    /// (USB 2.0 §9.1.1.5): `usb-device`'s [`UsbBus`] has no toggle operation, so only
+    /// the controller driver can.
+    pub fn endpoint_addresses(&self) -> [EndpointAddress; 2] {
+        self.transport.endpoint_addresses()
     }
 
     /// Poll current SCSI command

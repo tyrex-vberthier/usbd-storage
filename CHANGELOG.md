@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `uas` feature: the UAS Information Unit codec and command tag table
 - `transfer` feature: the `TransferBus` trait, and zero-copy data phases for `BulkOnly` (`enable_zero_copy`, `submit_data_in`, `submit_data_out`, `poll_data_transfer`)
 - `Scsi::interface`, `Ufi::interface` and `ScsiUas::interface`: the interface number the class allocated, which is the `wIndex` its Bulk-Only class requests must carry
+- `BulkOnly::endpoint_addresses`, `Scsi::endpoint_addresses`, `Ufi::endpoint_addresses` and `ScsiUas::endpoint_addresses`: the addresses of every endpoint the interface allocated, for a firmware that resets their data toggles on `SET_INTERFACE`
 - `Transport::control_out`, defaulted to ignoring the request (https://github.com/apohrebniak/usbd-storage/pull/36)
 
 ### Fixed
