@@ -10,6 +10,7 @@ use crate::transport::uas::{TRANSPORT_UAS, Uas};
 use core::borrow::BorrowMut;
 use usb_device::bus::{InterfaceNumber, UsbBus, UsbBusAllocator};
 use usb_device::class::{ControlIn, ControlOut, UsbClass};
+use usb_device::control::{Recipient, Request, RequestType};
 use usb_device::descriptor::DescriptorWriter;
 use usb_device::endpoint::EndpointAddress;
 
@@ -185,9 +186,22 @@ where
         }
     }
 
-    /// The Bulk-Only Mass Storage Reset, on alternate setting 0. Through [Scsi],
-    /// which leaves a request for another interface alone.
+    /// A standard `SET_CONFIGURATION`, whatever its value: back to alternate
+    /// setting 0 (USB 2.0 §9.1.1.5), which usb-device does not tell a class.
+    /// The request is only observed: usb-device still answers it and moves its
+    /// own state.
+    ///
+    /// Otherwise the Bulk-Only Mass Storage Reset, on alternate setting 0.
+    /// Through [Scsi], which leaves a request for another interface alone.
     fn control_out(&mut self, xfer: ControlOut<Bus>) {
+        let req = xfer.request();
+        if req.request_type == RequestType::Standard
+            && req.recipient == Recipient::Device
+            && req.request == Request::SET_CONFIGURATION
+        {
+            UsbClass::reset(self);
+            return;
+        }
         if self.active_alt == 0 {
             self.bot.control_out(xfer);
         }
@@ -212,7 +226,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use usb_device::bus::PollResult;
     use usb_device::class_prelude::EndpointType;
-    use usb_device::device::{UsbDevice, UsbDeviceBuilder, UsbVidPid};
+    use usb_device::device::{UsbDevice, UsbDeviceBuilder, UsbDeviceState, UsbVidPid};
     use usb_device::{UsbDirection, UsbError};
 
     type TestResult = result::Result<(), Box<dyn std::error::Error>>;
@@ -517,6 +531,87 @@ mod tests {
         UsbClass::reset(&mut class);
         assert_eq!(class.active_alt(), 0, "a bus reset goes back to BOT");
         assert!(class.uas.table.is_empty(), "and clears UAS");
+        Ok(())
+    }
+
+    /// A UAS command in flight on alt 1, to see a reset clear it.
+    fn put_uas_command_in_flight(bus: &MockBus, class: &mut Class) {
+        let ours = class.bot.interface;
+        let cmd_pipe = class.uas.cmd_ep.address();
+        class.set_alt_setting(ours, 1);
+        host_sends(bus, cmd_pipe, command_iu(7));
+        class.poll();
+        assert_eq!(class.uas.table.len(), 1, "a UAS command is in flight");
+    }
+
+    #[test]
+    fn set_configuration_returns_to_bot_and_is_left_to_usb_device() -> TestResult {
+        for (value, state) in [
+            (1, UsbDeviceState::Configured),
+            (0, UsbDeviceState::Default),
+            (2, UsbDeviceState::Default),
+        ] {
+            // Given: UAS selected with a command in flight
+            let (bus, mut class, _other, mut device) = new_device();
+            put_uas_command_in_flight(&bus, &mut class);
+
+            // When: the host reconfigures the device, with no bus reset
+            let answer = control(&bus, &mut device, &mut class, setup(0x00, 9, value, 0, 0));
+
+            // Then: the class is back on BOT and usb-device still handled the request
+            assert_eq!(class.active_alt(), 0, "value {value}: back to alt 0");
+            assert!(class.bot().is_some(), "value {value}: BOT is active");
+            assert!(class.uas().is_none(), "value {value}: UAS is not");
+            assert!(class.uas.table.is_empty(), "value {value}: UAS is cleared");
+            assert_eq!(
+                answer.is_some(),
+                value <= 1,
+                "value {value}: usb-device accepts or refuses it, not the class"
+            );
+            assert_eq!(device.state(), state, "value {value}: usb-device state");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn set_configuration_clears_a_pending_bot_command() -> TestResult {
+        // Given: a CBW taken in on alt 0
+        let (bus, mut class, _other, mut device) = new_device();
+        let (_, bot_out) = class.data_pipe_addresses();
+        host_sends(&bus, bot_out, cbw());
+        class.poll();
+        assert!(class.bot.transport.get_command().is_some(), "a BOT command");
+
+        // When
+        control(&bus, &mut device, &mut class, setup(0x00, 9, 1, 0, 0));
+
+        // Then
+        assert!(
+            class.bot.transport.get_command().is_none(),
+            "BOT starts over after a configuration change"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn other_requests_leave_the_alternate_setting_alone() -> TestResult {
+        for (name, request) in [
+            ("standard device SET_FEATURE", setup(0x00, 3, 1, 0, 0)),
+            ("SET_CONFIGURATION to an interface", setup(0x01, 9, 1, 0, 0)),
+            (
+                "class-type request 9 to the device",
+                setup(0x20, 9, 1, 0, 0),
+            ),
+            ("standard device request 8", setup(0x00, 8, 1, 0, 0)),
+        ] {
+            let (bus, mut class, _other, mut device) = new_device();
+            put_uas_command_in_flight(&bus, &mut class);
+
+            control(&bus, &mut device, &mut class, request);
+
+            assert_eq!(class.active_alt(), 1, "{name}: stays on UAS");
+            assert_eq!(class.uas.table.len(), 1, "{name}: UAS is not cleared");
+        }
         Ok(())
     }
 
